@@ -56,6 +56,8 @@ use super::{
 };
 #[cfg(feature = "experimental-algorithms")]
 use crate::types::events::room::encrypted::OlmV2Curve25519AesSha2Content;
+#[cfg(feature = "experimental-x509-identity-verification")]
+use crate::x509::X509Signer;
 use crate::{
     DecryptionSettings, Device, OlmError, SignatureError, TrustRequirement,
     dehydrated_devices::DehydrationError,
@@ -814,11 +816,18 @@ impl Account {
     ///   this device to the server.
     pub async fn bootstrap_cross_signing(
         &self,
+        #[cfg(feature = "experimental-x509-identity-verification")] x509_signer: Option<
+            &X509Signer,
+        >,
     ) -> Result<
         (PrivateCrossSigningIdentity, UploadSigningKeysRequest, SignatureUploadRequest),
         SignatureError,
     > {
-        let identity = PrivateCrossSigningIdentity::for_account(self)?;
+        let identity = PrivateCrossSigningIdentity::for_account(
+            self,
+            #[cfg(feature = "experimental-x509-identity-verification")]
+            x509_signer,
+        )?;
 
         let signature_request = identity.sign_account(self.static_data()).await?;
 
@@ -832,10 +841,13 @@ impl Account {
         &self,
         cross_signing_key: &mut CrossSigningKey,
     ) -> Result<(), SignatureError> {
-        let signature = self.sign_json(to_canonical_value(&cross_signing_key)?)?;
+        let canonical_json = to_canonical_value(&cross_signing_key)?;
+        let signer = self.user_id().to_owned();
+
+        let signature = self.sign_json(canonical_json)?;
 
         cross_signing_key.signatures.add_signature(
-            self.user_id().to_owned(),
+            signer,
             DeviceKeyId::from_parts(DeviceKeyAlgorithm::Ed25519, self.device_id()),
             signature,
         );

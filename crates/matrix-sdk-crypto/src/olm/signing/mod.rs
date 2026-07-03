@@ -30,12 +30,14 @@ use tokio::sync::Mutex;
 use vodozemac::Ed25519Signature;
 
 use super::StaticAccountData;
+#[cfg(feature = "experimental-x509-identity-verification")]
+use crate::x509::X509Signer;
 use crate::{
     Account, DeviceData, OtherUserIdentityData, OwnUserIdentity, OwnUserIdentityData,
     error::SignatureError,
     store::SecretImportError,
     types::{
-        DeviceKeys, MasterPubkey, SelfSigningPubkey, UserSigningPubkey,
+        CrossSigningKey, DeviceKeys, MasterPubkey, SelfSigningPubkey, UserSigningPubkey,
         requests::UploadSigningKeysRequest,
     },
 };
@@ -566,10 +568,23 @@ impl PrivateCrossSigningIdentity {
      */
     pub(crate) fn for_account(
         account: &Account,
+        #[cfg(feature = "experimental-x509-identity-verification")] x509_signer: Option<
+            &X509Signer,
+        >,
     ) -> Result<PrivateCrossSigningIdentity, SignatureError> {
         let mut master = MasterSigning::new(account.user_id().into());
 
-        account.sign_cross_signing_key(master.public_key_mut().as_mut())?;
+        // TODO: AJB: some duplication with
+        // matrix_sdk_crypto::identities::user::OwnUserIdentity::verify
+
+        let cross_signing_key: &mut CrossSigningKey = &mut *master.public_key_mut().as_mut();
+
+        account.sign_cross_signing_key(cross_signing_key)?;
+
+        #[cfg(feature = "experimental-x509-identity-verification")]
+        if let Some(x509_signer) = x509_signer {
+            x509_signer.sign_cross_signing_key(&account.user_id, cross_signing_key)?;
+        }
 
         Ok(Self::new_helper(account.user_id(), master))
     }
@@ -749,7 +764,12 @@ mod tests {
     #[async_test]
     async fn test_private_identity_signed_by_account() {
         let account = Account::with_device_id(user_id(), device_id!("DEVICEID"));
-        let identity = PrivateCrossSigningIdentity::for_account(&account).unwrap();
+        let identity = PrivateCrossSigningIdentity::for_account(
+            &account,
+            #[cfg(feature = "experimental-x509-identity-verification")]
+            None,
+        )
+        .unwrap();
         let master = identity.master_key.lock().await;
         let master = master.as_ref().unwrap();
 
@@ -769,10 +789,50 @@ mod tests {
         assert!(!master.public_key().signatures().is_empty());
     }
 
+    #[cfg(feature = "experimental-x509-identity-verification")]
+    #[async_test]
+    async fn test_private_identity_signed_by_x509() {
+        use crate::x509::{RustRawX509Signer, RustRawX509Verifier, X509Signer, X509Verifier};
+
+        let account = Account::with_device_id(user_id(), device_id!("DEVICEID"));
+        let (cert, signing_key) =
+            crate::x509::tests::cert_and_key_with_email_in_subject_distinguished_name(
+                "example@localhost",
+            );
+
+        let cert_pem = cert.pem();
+        let key_pem = signing_key.serialize_pem();
+        let x509_signer = {
+            let rust_raw_x509_signer =
+                RustRawX509Signer::new_from_pem_data(&cert_pem, &key_pem).unwrap();
+            X509Signer::new(Arc::new(rust_raw_x509_signer))
+        };
+
+        // When we pass in an X509Signer to for_account, ...
+        let identity =
+            PrivateCrossSigningIdentity::for_account(&account, Some(&x509_signer)).unwrap();
+        let master = identity.master_key.lock().await;
+        let master = master.as_ref().unwrap();
+
+        let public_key = master.public_key().as_ref();
+
+        // ... the resulting cross-signing identity should be signed with X.509
+        let x509_verifier = {
+            let rust_raw_x509_verifier = RustRawX509Verifier::new_from_pem_data(&cert_pem).unwrap();
+            X509Verifier::new(Arc::new(rust_raw_x509_verifier))
+        };
+        assert!(x509_verifier.verify_signed_object(user_id(), public_key));
+    }
+
     #[async_test]
     async fn test_sign_device() {
         let account = Account::with_device_id(user_id(), device_id!("DEVICEID"));
-        let identity = PrivateCrossSigningIdentity::for_account(&account).unwrap();
+        let identity = PrivateCrossSigningIdentity::for_account(
+            &account,
+            #[cfg(feature = "experimental-x509-identity-verification")]
+            None,
+        )
+        .unwrap();
 
         let mut device = DeviceData::from_account(&account);
         let self_signing = identity.self_signing_key.lock().await;
@@ -789,11 +849,21 @@ mod tests {
     #[async_test]
     async fn test_sign_user_identity() {
         let account = Account::with_device_id(user_id(), device_id!("DEVICEID"));
-        let identity = PrivateCrossSigningIdentity::for_account(&account).unwrap();
+        let identity = PrivateCrossSigningIdentity::for_account(
+            &account,
+            #[cfg(feature = "experimental-x509-identity-verification")]
+            None,
+        )
+        .unwrap();
 
         let bob_account =
             Account::with_device_id(user_id!("@bob:localhost"), device_id!("DEVICEID"));
-        let bob_private = PrivateCrossSigningIdentity::for_account(&bob_account).unwrap();
+        let bob_private = PrivateCrossSigningIdentity::for_account(
+            &bob_account,
+            #[cfg(feature = "experimental-x509-identity-verification")]
+            None,
+        )
+        .unwrap();
         let mut bob_public = OtherUserIdentityData::from_private(&bob_private).await;
 
         let user_signing = identity.user_signing_key.lock().await;
