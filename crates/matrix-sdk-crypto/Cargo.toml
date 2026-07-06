@@ -14,6 +14,11 @@ version = "0.18.0"
 [package.metadata.docs.rs]
 rustdoc-args = ["--cfg", "docsrs", "--generate-link-to-definition"]
 
+# `cargo-machete` doesn't consider lib renames unless `--with-metadata`
+# is passed, but this errors CI further.
+[package.metadata.cargo-machete]
+ignored = ["rustls-webpki"]
+
 [features]
 default = []
 automatic-room-key-forwarding = []
@@ -47,6 +52,9 @@ experimental-push-secrets = []
 # Enable experirmental support for verifying user identities via X.509 certificates
 experimental-x509-identity-verification = ["dep:cms", "dep:rsa", "sha2/oid"]
 
+# Enable a pure-rust implementation of the X.509 signer and verifier, via `rustls`.
+rust-x509-verifier-impl = ["experimental-x509-identity-verification", "dep:rustls", "dep:rustls-webpki"]
+
 [dependencies]
 aes = { version = "0.8.4", default-features = false }
 aquamarine.workspace = true
@@ -72,6 +80,8 @@ rand.workspace = true
 rmp-serde.workspace = true
 rsa = { version = "0.9.10", default-features = false, optional = true }
 ruma = { workspace = true, features = ["rand", "unstable-msc3814"] }
+rustls = { version = "0.23.40", optional = true }
+rustls-webpki = { version = "0.103.13", default-features = false, optional = true }
 serde = { workspace = true, features = ["derive", "rc"] }
 serde_json.workspace = true
 sha2.workspace = true
@@ -104,10 +114,15 @@ matrix-sdk-test.workspace = true
 matrix-sdk-test-utils.workspace = true
 proptest.workspace = true
 rmp-serde.workspace = true
+rcgen = { version = "0.14.8", features = ["aws_lc_rs", "x509-parser"] }
 similar-asserts.workspace = true
 # required for async_test macro
 stream_assert.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+
+# The x509 tests use rust-x509-verifier-impl, so we need its dependencies
+rustls = { version = "0.23.40" }
+rustls-webpki = { version = "0.103.13", default-features = false }
 
 [lints]
 workspace = true
