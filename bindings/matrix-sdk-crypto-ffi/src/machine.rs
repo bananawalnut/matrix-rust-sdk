@@ -19,7 +19,7 @@ use matrix_sdk_crypto::{
     decrypt_room_key_export, encrypt_room_key_export,
     olm::ExportedRoomKey,
     store::types::{BackupDecryptionKey, Changes},
-    types::requests::ToDeviceRequest,
+    types::{Signature, requests::ToDeviceRequest},
 };
 use ruma::{
     DeviceKeyAlgorithm, EventId, OneTimeKeyAlgorithm, OwnedTransactionId, OwnedUserId, RoomId,
@@ -52,16 +52,15 @@ use tokio::runtime::Runtime;
 use zeroize::Zeroize;
 
 use crate::{
-    BackupKeys, BackupRecoveryKey, BootstrapCrossSigningError, BootstrapCrossSigningResult,
-    CrossSigningKeyExport, CrossSigningStatus, DecodeError, DecryptedEvent, Device, DeviceLists,
-    EncryptionSettings, EventEncryptionAlgorithm, KeyImportError, KeysImportResult,
-    MegolmV1BackupKey, ProgressListener, Request, RequestType, RequestVerificationResult,
-    RoomKeyCounts, RoomSettings, Sas, SignatureUploadRequest, StartSasResult, UserIdentity,
-    Verification, VerificationRequest,
+    BackupKeys, BackupRecoveryKey, BootstrapCrossSigningResult, CrossSigningKeyExport,
+    CrossSigningStatus, DecodeError, DecryptedEvent, Device, DeviceLists, EncryptionSettings,
+    EventEncryptionAlgorithm, KeyImportError, KeysImportResult, MegolmV1BackupKey,
+    ProgressListener, Request, RequestType, RequestVerificationResult, RoomKeyCounts, RoomSettings,
+    Sas, SignatureUploadRequest, StartSasResult, UserIdentity, Verification, VerificationRequest,
     dehydrated_devices::DehydratedDevices,
     error::{
-        CryptoStoreError, DecryptionError, SecretImportError, SecretsBundleExportError,
-        SignatureError,
+        BootstrapCrossSigningError, CryptoStoreError, DecryptionError, SecretImportError,
+        SecretsBundleExportError, SignatureError,
     },
     parse_user_id,
     responses::{OwnedResponse, response_from_string},
@@ -1537,7 +1536,10 @@ impl OlmMachine {
                             (
                                 k.to_string(),
                                 match v {
-                                    Ok(s) => s.to_base64(),
+                                    Ok(s) => match s {
+                                        Signature::Ed25519(s) => s.to_base64(),
+                                        _ => panic!("Device key produced non-ed25519 signature"),
+                                    },
                                     Err(i) => i.source,
                                 },
                             )
