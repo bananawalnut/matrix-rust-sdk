@@ -682,6 +682,16 @@ impl Encryption {
         Ok(result?)
     }
 
+    /// Force a fresh keys query for our own user before reporting whether this
+    /// device is cross-signed. Successful interactive verification uploads a
+    /// signature, but the cached verification state is only recomputed after a
+    /// keys query containing our own device.
+    pub async fn refresh_verification_state(&self) -> Result<VerificationState, ClientError> {
+        let user_id = self._client.user_id()?;
+        self.inner.request_user_identity(user_id.as_str().try_into()?).await?;
+        Ok(self.inner.verification_state().get().into())
+    }
+
     pub fn verification_state(&self) -> VerificationState {
         self.inner.verification_state().get().into()
     }
