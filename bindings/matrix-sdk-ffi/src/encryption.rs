@@ -682,6 +682,19 @@ impl Encryption {
         Ok(result?)
     }
 
+    /// Sign this device with the recovered private self-signing key and upload
+    /// the durable signature to the homeserver.
+    pub async fn sign_own_device(&self) -> Result<(), ClientError> {
+        let device = self
+            .inner
+            .get_own_device()
+            .await
+            .map_err(ClientError::from_err)?
+            .ok_or_else(|| ClientError::from_str("Own device is unavailable", None))?;
+        device.verify().await.map_err(ClientError::from_err)?;
+        Ok(())
+    }
+
     /// Force a fresh keys query for our own user before reporting whether this
     /// device is cross-signed. Successful interactive verification uploads a
     /// signature, but the cached verification state is only recomputed after a
