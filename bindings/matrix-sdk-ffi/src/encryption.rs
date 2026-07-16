@@ -241,6 +241,13 @@ impl From<encryption::VerificationState> for VerificationState {
     }
 }
 
+#[derive(uniffi::Record)]
+pub struct CrossSigningKeyStatus {
+    pub has_master_key: bool,
+    pub has_self_signing_key: bool,
+    pub has_user_signing_key: bool,
+}
+
 /// Struct containing the bundle of secrets to fully activate a new device for
 /// end-to-end encryption.
 #[derive(uniffi::Object)]
@@ -462,6 +469,16 @@ pub async fn database_contains_secrets_bundle(
 
 #[matrix_sdk_ffi_macros::export]
 impl Encryption {
+    /// Report only private cross-signing key presence. No key material crosses
+    /// the FFI boundary.
+    pub async fn cross_signing_status(&self) -> Option<CrossSigningKeyStatus> {
+        self.inner.cross_signing_status().await.map(|status| CrossSigningKeyStatus {
+            has_master_key: status.has_master,
+            has_self_signing_key: status.has_self_signing,
+            has_user_signing_key: status.has_user_signing,
+        })
+    }
+
     /// Get the public ed25519 key of our own device. This is usually what is
     /// called the fingerprint of the device.
     pub async fn ed25519_key(&self) -> Option<String> {
