@@ -101,6 +101,9 @@ pub enum ManualVerifyError {
     /// Error that happens when we try to sign the user or device.
     #[error(transparent)]
     Signature(#[from] matrix_sdk_base::crypto::SignatureError),
+    /// The homeserver returned HTTP success but rejected one or more signatures.
+    #[error("homeserver rejected uploaded signature")]
+    ServerFailures,
 }
 
 /// Error when requesting a verification.

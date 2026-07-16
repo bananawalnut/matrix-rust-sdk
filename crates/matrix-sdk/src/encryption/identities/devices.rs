@@ -27,6 +27,10 @@ use crate::{
     error::Result,
 };
 
+fn ensure_signature_upload_succeeded(has_failures: bool) -> Result<(), ManualVerifyError> {
+    if has_failures { Err(ManualVerifyError::ServerFailures) } else { Ok(()) }
+}
+
 /// Updates about [`Device`]s which got received over the `/keys/query`
 /// endpoint.
 #[derive(Clone, Debug, Default)]
@@ -290,7 +294,8 @@ impl Device {
     /// ```
     pub async fn verify(&self) -> Result<(), ManualVerifyError> {
         let request = self.inner.verify().await?;
-        self.client.send(request).await?;
+        let response = self.client.send(request).await?;
+        ensure_signature_upload_succeeded(!response.failures.is_empty())?;
 
         Ok(())
     }
@@ -578,5 +583,14 @@ impl UserDevices {
         let client = self.client.clone();
 
         self.inner.devices().map(move |d| Device { inner: d, client: client.clone() })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn signature_upload_response_failures_are_not_treated_as_success() {
+        assert!(super::ensure_signature_upload_succeeded(true).is_err());
+        assert!(super::ensure_signature_upload_succeeded(false).is_ok());
     }
 }
