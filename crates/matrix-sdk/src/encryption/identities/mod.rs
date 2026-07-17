@@ -87,7 +87,10 @@
 mod devices;
 mod users;
 
-pub use devices::{Device, DeviceUpdates, UserDevices};
+pub use devices::{
+    Device, DeviceSignatureDiagnostic, DeviceUpdates, SignatureUploadProcessing,
+    SignatureUploadTransport, UserDevices,
+};
 pub use matrix_sdk_base::crypto::types::MasterPubkey;
 pub use users::{IdentityUpdates, UserIdentity};
 

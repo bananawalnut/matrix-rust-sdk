@@ -129,6 +129,14 @@ pub struct Device {
     pub(crate) device_owner_identity: Option<UserIdentityData>,
 }
 
+pub struct DeviceSignaturePreparation {
+    pub request: SignatureUploadRequest,
+    pub private_key_matches_public_identity: bool,
+    pub local_device_keys_match_server_device: bool,
+    pub signed_object_matches_server_device: bool,
+    pub generated_signature_valid: bool,
+}
+
 #[cfg(not(tarpaulin_include))]
 impl std::fmt::Debug for Device {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -387,6 +395,31 @@ impl Device {
         } else {
             Err(SignatureError::UserIdMismatch)
         }
+    }
+
+    pub async fn prepare_signature_with_diagnostics(
+        &self,
+    ) -> Result<DeviceSignaturePreparation, SignatureError> {
+        let public_identity = match self.device_owner_identity.as_ref() {
+            Some(UserIdentityData::Own(identity)) => identity,
+            _ => return Err(SignatureError::MissingSigningKey),
+        };
+        let diagnostics = self
+            .verification_machine
+            .store
+            .private_identity
+            .lock()
+            .await
+            .sign_device_with_diagnostics(&self.inner, public_identity)
+            .await?;
+
+        Ok(DeviceSignaturePreparation {
+            request: diagnostics.request,
+            private_key_matches_public_identity: diagnostics.private_key_matches_public_identity,
+            local_device_keys_match_server_device: self.is_our_own_device(),
+            signed_object_matches_server_device: diagnostics.signed_object_matches_device,
+            generated_signature_valid: diagnostics.generated_signature_valid,
+        })
     }
 
     /// Set the local trust state of the device to the given state.

@@ -248,6 +248,32 @@ pub struct CrossSigningKeyStatus {
     pub has_user_signing_key: bool,
 }
 
+#[derive(uniffi::Enum)]
+pub enum DiagnosticUploadTransport {
+    Accepted,
+    Failed,
+}
+
+#[derive(uniffi::Enum)]
+pub enum DiagnosticUploadProcessing {
+    Accepted,
+    InvalidSignature,
+    OtherFailure,
+}
+
+#[derive(uniffi::Record)]
+pub struct CrossSigningDiagnosticReceipt {
+    pub public_identity_refreshed: bool,
+    pub private_self_signing_key_present: bool,
+    pub private_self_signing_key_matches_current_public_identity: bool,
+    pub local_own_device_key_matches_server_device_key: bool,
+    pub signed_object_matches_fresh_server_device_object: bool,
+    pub generated_signature_valid_locally: bool,
+    pub upload_transport: DiagnosticUploadTransport,
+    pub upload_processing: DiagnosticUploadProcessing,
+    pub post_upload_server_signature_present: bool,
+}
+
 /// Struct containing the bundle of secrets to fully activate a new device for
 /// end-to-end encryption.
 #[derive(uniffi::Object)]
@@ -697,6 +723,71 @@ impl Encryption {
         recovery_key.zeroize();
 
         Ok(result?)
+    }
+
+    /// Perform exactly one current-device signature upload and return only
+    /// boolean/enum diagnostics. No keys, signatures, IDs, or payloads cross FFI.
+    pub async fn diagnose_and_sign_own_device(
+        &self,
+    ) -> Result<CrossSigningDiagnosticReceipt, ClientError> {
+        let user_id = self._client.user_id()?;
+        self.inner
+            .request_user_identity(user_id.as_str().try_into()?)
+            .await
+            .map_err(ClientError::from_err)?;
+        let private_self_signing_key_present =
+            self.inner.cross_signing_status().await.is_some_and(|status| status.has_self_signing);
+        let device = self
+            .inner
+            .get_own_device()
+            .await
+            .map_err(ClientError::from_err)?
+            .ok_or_else(|| ClientError::from_str("Own device is unavailable", None))?;
+        let diagnostics = device.verify_with_diagnostics().await.map_err(ClientError::from_err)?;
+        let upload_transport = match diagnostics.upload_transport {
+            matrix_sdk::encryption::identities::SignatureUploadTransport::Accepted => {
+                DiagnosticUploadTransport::Accepted
+            }
+            matrix_sdk::encryption::identities::SignatureUploadTransport::Failed => {
+                DiagnosticUploadTransport::Failed
+            }
+        };
+        let upload_processing = match diagnostics.upload_processing {
+            matrix_sdk::encryption::identities::SignatureUploadProcessing::Accepted => {
+                DiagnosticUploadProcessing::Accepted
+            }
+            matrix_sdk::encryption::identities::SignatureUploadProcessing::InvalidSignature => {
+                DiagnosticUploadProcessing::InvalidSignature
+            }
+            matrix_sdk::encryption::identities::SignatureUploadProcessing::OtherFailure => {
+                DiagnosticUploadProcessing::OtherFailure
+            }
+        };
+        self.inner
+            .request_user_identity(user_id.as_str().try_into()?)
+            .await
+            .map_err(ClientError::from_err)?;
+        let post_upload_server_signature_present = self
+            .inner
+            .get_own_device()
+            .await
+            .map_err(ClientError::from_err)?
+            .is_some_and(|device| device.is_cross_signed_by_owner());
+
+        Ok(CrossSigningDiagnosticReceipt {
+            public_identity_refreshed: true,
+            private_self_signing_key_present,
+            private_self_signing_key_matches_current_public_identity: diagnostics
+                .private_key_matches_public_identity,
+            local_own_device_key_matches_server_device_key: diagnostics
+                .local_device_keys_match_server_device,
+            signed_object_matches_fresh_server_device_object: diagnostics
+                .signed_object_matches_server_device,
+            generated_signature_valid_locally: diagnostics.generated_signature_valid,
+            upload_transport,
+            upload_processing,
+            post_upload_server_signature_present,
+        })
     }
 
     /// Sign this device with the recovered private self-signing key and upload

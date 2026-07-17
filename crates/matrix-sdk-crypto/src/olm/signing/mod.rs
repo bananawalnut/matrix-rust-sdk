@@ -119,6 +119,13 @@ impl CrossSigningStatus {
     }
 }
 
+pub(crate) struct DeviceSigningDiagnostics {
+    pub request: SignatureUploadRequest,
+    pub private_key_matches_public_identity: bool,
+    pub signed_object_matches_device: bool,
+    pub generated_signature_valid: bool,
+}
+
 impl PrivateCrossSigningIdentity {
     /// Get the user id that this identity belongs to.
     pub fn user_id(&self) -> &UserId {
@@ -492,6 +499,32 @@ impl PrivateCrossSigningIdentity {
         self.sign_device_keys(&mut device_keys).await
     }
 
+    pub(crate) async fn sign_device_with_diagnostics(
+        &self,
+        device: &DeviceData,
+        public_identity: &OwnUserIdentityData,
+    ) -> Result<DeviceSigningDiagnostics, SignatureError> {
+        let mut original = device.as_device_keys().to_owned();
+        original.signatures.clear();
+        let mut signed = original.clone();
+        let request = self.sign_device_keys(&mut signed).await?;
+        let private_key_matches_public_identity = self
+            .self_signing_public_key()
+            .await
+            .is_some_and(|key| &key == public_identity.self_signing_key());
+        let generated_signature_valid =
+            public_identity.self_signing_key().verify_device_keys(&signed).is_ok();
+        let mut normalized_signed = signed;
+        normalized_signed.signatures.clear();
+
+        Ok(DeviceSigningDiagnostics {
+            request,
+            private_key_matches_public_identity,
+            signed_object_matches_device: normalized_signed == original,
+            generated_signature_valid,
+        })
+    }
+
     /// Sign an Olm account with this private identity.
     pub(crate) async fn sign_account(
         &self,
@@ -680,7 +713,7 @@ mod tests {
 
     use super::{PrivateCrossSigningIdentity, pk_signing::Signing};
     use crate::{
-        identities::{DeviceData, OtherUserIdentityData},
+        identities::{DeviceData, OtherUserIdentityData, OwnUserIdentityData},
         olm::{Account, SignedJsonObject, VerifyJson},
         types::Signatures,
     };
@@ -834,6 +867,36 @@ mod tests {
 
         let public_key = &self_signing.public_key();
         public_key.verify_device(&device).unwrap()
+    }
+
+    #[async_test]
+    async fn test_sign_device_with_diagnostics_validates_exact_object_and_identity() {
+        let account = Account::with_device_id(user_id(), device_id!("DEVICEID"));
+        let identity = PrivateCrossSigningIdentity::for_account(&account);
+        let public_identity = OwnUserIdentityData::from_private(&identity).await;
+        let device = DeviceData::from_account(&account);
+
+        let diagnostics =
+            identity.sign_device_with_diagnostics(&device, &public_identity).await.unwrap();
+
+        assert!(diagnostics.private_key_matches_public_identity);
+        assert!(diagnostics.signed_object_matches_device);
+        assert!(diagnostics.generated_signature_valid);
+    }
+
+    #[async_test]
+    async fn test_sign_device_with_diagnostics_detects_stale_private_identity() {
+        let account = Account::with_device_id(user_id(), device_id!("DEVICEID"));
+        let identity = PrivateCrossSigningIdentity::for_account(&account);
+        let other_identity = PrivateCrossSigningIdentity::new(user_id().to_owned());
+        let current_public_identity = OwnUserIdentityData::from_private(&other_identity).await;
+        let device = DeviceData::from_account(&account);
+
+        let diagnostics =
+            identity.sign_device_with_diagnostics(&device, &current_public_identity).await.unwrap();
+
+        assert!(!diagnostics.private_key_matches_public_identity);
+        assert!(!diagnostics.generated_signature_valid);
     }
 
     #[async_test]

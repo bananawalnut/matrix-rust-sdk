@@ -18,7 +18,11 @@ use matrix_sdk_base::crypto::{
     Device as BaseDevice, DeviceData, LocalTrust, UserDevices as BaseUserDevices,
     store::CryptoStoreError,
 };
-use ruma::{DeviceId, OwnedDeviceId, OwnedUserId, events::key::verification::VerificationMethod};
+use ruma::{
+    DeviceId, OwnedDeviceId, OwnedUserId,
+    api::client::keys::upload_signatures::v3::Response as UploadSignaturesResponse,
+    events::key::verification::VerificationMethod,
+};
 
 use super::ManualVerifyError;
 use crate::{
@@ -101,6 +105,48 @@ impl DeviceUpdates {
 pub struct Device {
     pub(crate) inner: BaseDevice,
     pub(crate) client: Client,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SignatureUploadTransport {
+    Accepted,
+    Failed,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SignatureUploadProcessing {
+    Accepted,
+    InvalidSignature,
+    OtherFailure,
+}
+
+pub struct DeviceSignatureDiagnostic {
+    pub private_key_matches_public_identity: bool,
+    pub local_device_keys_match_server_device: bool,
+    pub signed_object_matches_server_device: bool,
+    pub generated_signature_valid: bool,
+    pub upload_transport: SignatureUploadTransport,
+    pub upload_processing: SignatureUploadProcessing,
+}
+
+fn classify_signature_upload(response: &UploadSignaturesResponse) -> SignatureUploadProcessing {
+    if response.failures.is_empty() {
+        return SignatureUploadProcessing::Accepted;
+    }
+    let invalid_signature =
+        response.failures.values().flat_map(|failures| failures.values()).any(|failure| {
+            serde_json::to_value(failure)
+                .ok()
+                .and_then(|value| {
+                    value.get("errcode").and_then(|code| code.as_str()).map(str::to_owned)
+                })
+                .is_some_and(|code| code == "M_INVALID_SIGNATURE")
+        });
+    if invalid_signature {
+        SignatureUploadProcessing::InvalidSignature
+    } else {
+        SignatureUploadProcessing::OtherFailure
+    }
 }
 
 impl Deref for Device {
@@ -298,6 +344,27 @@ impl Device {
         ensure_signature_upload_succeeded(!response.failures.is_empty())?;
 
         Ok(())
+    }
+
+    pub async fn verify_with_diagnostics(
+        &self,
+    ) -> Result<DeviceSignatureDiagnostic, ManualVerifyError> {
+        let prepared = self.inner.prepare_signature_with_diagnostics().await?;
+        let (upload_transport, upload_processing) = match self.client.send(prepared.request).await {
+            Ok(response) => {
+                (SignatureUploadTransport::Accepted, classify_signature_upload(&response))
+            }
+            Err(_) => (SignatureUploadTransport::Failed, SignatureUploadProcessing::OtherFailure),
+        };
+
+        Ok(DeviceSignatureDiagnostic {
+            private_key_matches_public_identity: prepared.private_key_matches_public_identity,
+            local_device_keys_match_server_device: prepared.local_device_keys_match_server_device,
+            signed_object_matches_server_device: prepared.signed_object_matches_server_device,
+            generated_signature_valid: prepared.generated_signature_valid,
+            upload_transport,
+            upload_processing,
+        })
     }
 
     /// Is the device considered to be verified.
