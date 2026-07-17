@@ -20,7 +20,9 @@ use matrix_sdk_base::{
 };
 use ruma::{
     OwnedUserId, UserId,
+    encryption::DeviceKeys as RumaDeviceKeys,
     events::{key::verification::VerificationMethod, room::message::RoomMessageEventContent},
+    serde::Raw,
 };
 
 use super::{ManualVerifyError, RequestVerificationError};
@@ -133,6 +135,17 @@ impl UserIdentity {
         match &self.inner {
             CryptoUserIdentity::Own(identity) => identity.user_id(),
             CryptoUserIdentity::Other(identity) => identity.user_id(),
+        }
+    }
+
+    /// Verify that raw device keys carry a valid signature from this account's
+    /// current public self-signing key.
+    pub fn verifies_raw_device_keys(&self, device_keys: &Raw<RumaDeviceKeys>) -> bool {
+        match &self.inner {
+            CryptoUserIdentity::Own(identity) => {
+                identity.self_signing_key().verify_raw_device_keys(device_keys.json()).is_ok()
+            }
+            CryptoUserIdentity::Other(_) => false,
         }
     }
 

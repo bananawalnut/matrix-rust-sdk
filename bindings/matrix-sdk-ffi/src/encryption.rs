@@ -770,16 +770,14 @@ impl Encryption {
                 DiagnosticUploadProcessing::OtherFailure
             }
         };
-        self.inner
-            .request_user_identity(user_id.as_str().try_into()?)
-            .await
-            .map_err(ClientError::from_err)?;
+        let post_upload_raw_device =
+            self.inner.request_own_device_keys_raw().await.map_err(ClientError::from_err)?;
         let post_upload_server_signature_present = self
             .inner
-            .get_own_device()
+            .get_user_identity(user_id.as_str().try_into()?)
             .await
             .map_err(ClientError::from_err)?
-            .is_some_and(|device| device.is_cross_signed_by_owner());
+            .is_some_and(|identity| identity.verifies_raw_device_keys(&post_upload_raw_device));
 
         Ok(CrossSigningDiagnosticReceipt {
             public_identity_refreshed: true,

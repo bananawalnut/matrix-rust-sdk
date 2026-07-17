@@ -1,14 +1,15 @@
 use std::collections::btree_map::Iter;
 
-use ruma::{OwnedDeviceKeyId, UserId, encryption::KeyUsage};
+use ruma::{OwnedDeviceKeyId, UserId, canonical_json::CanonicalJsonValue, encryption::KeyUsage};
 use serde::{Deserialize, Serialize};
+use serde_json::value::RawValue;
 use vodozemac::Ed25519PublicKey;
 
 use super::{CrossSigningKey, SigningKey};
 use crate::{
     DeviceData, SignatureError,
-    olm::VerifyJson,
-    types::{DeviceKeys, SigningKeys},
+    olm::{VerifyJson, utility::to_signable_json},
+    types::{DeviceKeys, Signatures, SigningKeys},
 };
 
 /// Wrapper for a cross signing key marking it as a self signing key.
@@ -47,6 +48,30 @@ impl SelfSigningPubkey {
     pub fn verify_device_keys(&self, device_keys: &DeviceKeys) -> Result<(), SignatureError> {
         if let Some((key_id, key)) = self.0.get_first_key_and_id() {
             key.verify_json(&self.0.user_id, key_id, device_keys)
+        } else {
+            Err(SignatureError::UnsupportedAlgorithm)
+        }
+    }
+
+    /// Verify raw device keys without discarding server-provided extension fields.
+    pub fn verify_raw_device_keys(&self, device_keys: &RawValue) -> Result<(), SignatureError> {
+        #[derive(Deserialize)]
+        struct RawSignatures {
+            signatures: Signatures,
+        }
+
+        let signatures: RawSignatures = serde_json::from_str(device_keys.get())
+            .map_err(ruma::canonical_json::CanonicalJsonError::InvalidRawValue)?;
+        let device_keys: CanonicalJsonValue = serde_json::from_str(device_keys.get())
+            .map_err(ruma::canonical_json::CanonicalJsonError::InvalidRawValue)?;
+        let canonical_json = to_signable_json(device_keys)?;
+        if let Some((key_id, key)) = self.0.get_first_key_and_id() {
+            key.verify_canonicalized_json(
+                &self.0.user_id,
+                key_id,
+                &signatures.signatures,
+                &canonical_json,
+            )
         } else {
             Err(SignatureError::UnsupportedAlgorithm)
         }

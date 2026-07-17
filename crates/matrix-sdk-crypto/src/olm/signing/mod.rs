@@ -921,6 +921,14 @@ mod tests {
 
         let request = identity.sign_raw_device_keys(raw).await.unwrap();
         let signed = request.signed_keys.get(user_id()).unwrap().iter().next().unwrap().1;
+        let public_identity = OwnUserIdentityData::from_private(&identity).await;
+        public_identity
+            .self_signing_key()
+            .verify_raw_device_keys(signed)
+            .expect("the current public self-signing key must verify the raw signed device");
+        let stale_identity = PrivateCrossSigningIdentity::new(user_id().to_owned());
+        let stale_public_identity = OwnUserIdentityData::from_private(&stale_identity).await;
+        assert!(stale_public_identity.self_signing_key().verify_raw_device_keys(signed).is_err());
         let signed: serde_json::Value = serde_json::from_str(signed.get()).unwrap();
 
         assert_eq!(signed["com.example.server_extension"]["must"], "survive");
