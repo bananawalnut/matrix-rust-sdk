@@ -21,7 +21,8 @@ use matrix_sdk_base::crypto::{
 use ruma::{
     DeviceId, OwnedDeviceId, OwnedUserId,
     api::client::keys::upload_signatures::v3::Response as UploadSignaturesResponse,
-    events::key::verification::VerificationMethod,
+    encryption::DeviceKeys as RumaDeviceKeys, events::key::verification::VerificationMethod,
+    serde::Raw,
 };
 
 use super::ManualVerifyError;
@@ -116,6 +117,7 @@ pub enum SignatureUploadTransport {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SignatureUploadProcessing {
     Accepted,
+    KeyMismatch,
     InvalidSignature,
     OtherFailure,
 }
@@ -133,16 +135,26 @@ fn classify_signature_upload(response: &UploadSignaturesResponse) -> SignatureUp
     if response.failures.is_empty() {
         return SignatureUploadProcessing::Accepted;
     }
-    let invalid_signature =
-        response.failures.values().flat_map(|failures| failures.values()).any(|failure| {
-            serde_json::to_value(failure)
-                .ok()
-                .and_then(|value| {
-                    value.get("errcode").and_then(|code| code.as_str()).map(str::to_owned)
-                })
-                .is_some_and(|code| code == "M_INVALID_SIGNATURE")
-        });
-    if invalid_signature {
+    let mut result = SignatureUploadProcessing::OtherFailure;
+    for failure in response.failures.values().flat_map(|failures| failures.values()) {
+        let Ok(failure) = serde_json::to_value(failure) else { continue };
+        match classify_signature_upload_failure(&failure) {
+            SignatureUploadProcessing::KeyMismatch => {
+                return SignatureUploadProcessing::KeyMismatch;
+            }
+            SignatureUploadProcessing::InvalidSignature => {
+                result = SignatureUploadProcessing::InvalidSignature;
+            }
+            _ => {}
+        }
+    }
+    result
+}
+
+fn classify_signature_upload_failure(failure: &serde_json::Value) -> SignatureUploadProcessing {
+    if failure.get("error").and_then(|error| error.as_str()) == Some("Key does not match") {
+        SignatureUploadProcessing::KeyMismatch
+    } else if failure.get("errcode").and_then(|code| code.as_str()) == Some("M_INVALID_SIGNATURE") {
         SignatureUploadProcessing::InvalidSignature
     } else {
         SignatureUploadProcessing::OtherFailure
@@ -350,6 +362,21 @@ impl Device {
         &self,
     ) -> Result<DeviceSignatureDiagnostic, ManualVerifyError> {
         let prepared = self.inner.prepare_signature_with_diagnostics().await?;
+        self.send_prepared_diagnostic(prepared).await
+    }
+
+    pub async fn verify_raw_with_diagnostics(
+        &self,
+        raw: Raw<RumaDeviceKeys>,
+    ) -> Result<DeviceSignatureDiagnostic, ManualVerifyError> {
+        let prepared = self.inner.prepare_raw_signature_with_diagnostics(raw).await?;
+        self.send_prepared_diagnostic(prepared).await
+    }
+
+    async fn send_prepared_diagnostic(
+        &self,
+        prepared: matrix_sdk_base::crypto::DeviceSignaturePreparation,
+    ) -> Result<DeviceSignatureDiagnostic, ManualVerifyError> {
         let (upload_transport, upload_processing) = match self.client.send(prepared.request).await {
             Ok(response) => {
                 (SignatureUploadTransport::Accepted, classify_signature_upload(&response))
@@ -655,6 +682,19 @@ impl UserDevices {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn signature_upload_key_mismatch_is_classified() {
+        let failure = serde_json::json!({
+            "errcode": "M_UNKNOWN",
+            "error": "Key does not match"
+        });
+
+        assert_eq!(
+            super::classify_signature_upload_failure(&failure),
+            super::SignatureUploadProcessing::KeyMismatch
+        );
+    }
+
     #[test]
     fn signature_upload_response_failures_are_not_treated_as_success() {
         assert!(super::ensure_signature_upload_succeeded(true).is_err());

@@ -23,7 +23,9 @@ pub use pk_signing::{MasterSigning, PickledSignings, SelfSigning, SigningError, 
 use ruma::{
     DeviceKeyAlgorithm, DeviceKeyId, OwnedDeviceId, OwnedDeviceKeyId, OwnedUserId, UserId,
     api::client::keys::upload_signatures::v3::{Request as SignatureUploadRequest, SignedKeys},
+    encryption::DeviceKeys as RumaDeviceKeys,
     events::secret::request::SecretName,
+    serde::Raw,
 };
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
@@ -552,6 +554,32 @@ impl PrivateCrossSigningIdentity {
         Ok(SignatureUploadRequest::new(signed_keys))
     }
 
+    pub(crate) async fn sign_raw_device_keys(
+        &self,
+        raw: Raw<RumaDeviceKeys>,
+    ) -> Result<SignatureUploadRequest, SignatureError> {
+        let device_id = raw
+            .deserialize()
+            .map_err(ruma::canonical_json::CanonicalJsonError::InvalidRawValue)?
+            .device_id;
+        let mut value: serde_json::Value = serde_json::from_str(raw.json().get())
+            .map_err(ruma::canonical_json::CanonicalJsonError::InvalidRawValue)?;
+        self.self_signing_key
+            .lock()
+            .await
+            .as_ref()
+            .ok_or(SignatureError::MissingSigningKey)?
+            .sign_raw_device_json(&mut value)?;
+        let raw = Raw::from_json_string(
+            serde_json::to_string(&value)
+                .map_err(ruma::canonical_json::CanonicalJsonError::InvalidRawValue)?,
+        )
+        .map_err(ruma::canonical_json::CanonicalJsonError::InvalidRawValue)?;
+        let mut user_signed_keys = SignedKeys::new();
+        user_signed_keys.add_device_keys(device_id, raw);
+        Ok(SignatureUploadRequest::new([(self.user_id.clone(), user_signed_keys)].into()))
+    }
+
     pub(crate) async fn sign(&self, message: &str) -> Result<Ed25519Signature, SignatureError> {
         Ok(self
             .master_key
@@ -867,6 +895,39 @@ mod tests {
 
         let public_key = &self_signing.public_key();
         public_key.verify_device(&device).unwrap()
+    }
+
+    #[async_test]
+    async fn test_sign_raw_device_keys_preserves_server_json_extensions() {
+        use ruma::{encryption::DeviceKeys as RumaDeviceKeys, serde::Raw};
+
+        let identity = PrivateCrossSigningIdentity::new(user_id().to_owned());
+        let raw = Raw::<RumaDeviceKeys>::from_json_string(
+            serde_json::json!({
+                "user_id": user_id(),
+                "device_id": "DEVICEID",
+                "algorithms": ["m.olm.v1.curve25519-aes-sha2"],
+                "keys": {
+                    "curve25519:DEVICEID": "curve",
+                    "ed25519:DEVICEID": "ed"
+                },
+                "signatures": {},
+                "unsigned": {"device_display_name": "Zenith"},
+                "com.example.server_extension": {"must": "survive"}
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let request = identity.sign_raw_device_keys(raw).await.unwrap();
+        let signed = request.signed_keys.get(user_id()).unwrap().iter().next().unwrap().1;
+        let signed: serde_json::Value = serde_json::from_str(signed.get()).unwrap();
+
+        assert_eq!(signed["com.example.server_extension"]["must"], "survive");
+        assert_eq!(signed["unsigned"]["device_display_name"], "Zenith");
+        assert!(
+            signed["signatures"][user_id().as_str()].as_object().is_some_and(|v| !v.is_empty())
+        );
     }
 
     #[async_test]

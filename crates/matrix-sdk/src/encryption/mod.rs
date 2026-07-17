@@ -73,13 +73,15 @@ use ruma::{
         error::{ErrorBody, StandardErrorBody},
     },
     assign,
+    encryption::DeviceKeys as RumaDeviceKeys,
     events::room::{
         MediaSource, ThumbnailInfo,
         member::{MembershipChange, OriginalSyncRoomMemberEvent},
     },
+    serde::Raw,
 };
 #[cfg(feature = "experimental-send-custom-to-device")]
-use ruma::{events::AnyToDeviceEventContent, serde::Raw, to_device::DeviceIdOrAllDevices};
+use ruma::{events::AnyToDeviceEventContent, to_device::DeviceIdOrAllDevices};
 use serde::{Deserialize, de::Error as _};
 use tasks::BundleReceiverTask;
 use tokio::sync::{Mutex, RwLockReadGuard};
@@ -129,6 +131,14 @@ use matrix_sdk_common::cross_process_lock::CrossProcessLockConfig;
 #[cfg(feature = "experimental-send-custom-to-device")]
 use crate::config::RequestConfig;
 pub use crate::error::RoomKeyImportError;
+
+fn own_device_keys_from_response(
+    response: &get_keys::v3::Response,
+    user_id: &UserId,
+    device_id: &DeviceId,
+) -> Option<Raw<RumaDeviceKeys>> {
+    response.device_keys.get(user_id)?.get(device_id).cloned()
+}
 
 /// Error type describing failures that can happen while exporting a
 /// [`SecretsBundle`] from a SQLite store.
@@ -1355,6 +1365,19 @@ impl Encryption {
         Ok(identity.map(|i| UserIdentity::new(self.client.clone(), i)))
     }
 
+    /// Fetch the current own-device JSON directly from the homeserver response,
+    /// preserving fields that typed SDK models may not retain.
+    pub async fn request_own_device_keys_raw(&self) -> Result<Raw<RumaDeviceKeys>> {
+        let user_id = self.client.user_id().ok_or(Error::AuthenticationRequired)?;
+        let device_id = self.client.device_id().ok_or(Error::AuthenticationRequired)?;
+        let olm = self.client.olm_machine().await;
+        let olm = olm.as_ref().ok_or(Error::NoOlmMachine)?;
+        let (request_id, mut request) = olm.query_keys_for_users(iter::once(user_id));
+        request.device_keys.insert(user_id.to_owned(), vec![device_id.to_owned()]);
+        let response = self.client.keys_query(&request_id, request.device_keys).await?;
+        own_device_keys_from_response(&response, user_id, device_id).ok_or(Error::InsufficientData)
+    }
+
     /// Returns a stream of device updates, allowing users to listen for
     /// notifications about new or changed devices.
     ///
@@ -2481,6 +2504,7 @@ mod tests {
         matchers::{header, method, path_regex},
     };
 
+    use super::own_device_keys_from_response;
     use crate::{
         Client, assert_next_matches_with_timeout,
         config::RequestConfig,
@@ -2908,6 +2932,39 @@ mod tests {
                 || path.ends_with("/keys/upload")
                 || path.ends_with("/keys/device_signing/upload")
         }));
+    }
+
+    #[test]
+    fn own_device_selection_preserves_raw_server_json() {
+        use ruma::{
+            api::client::keys::get_keys::v3::Response, device_id,
+            encryption::DeviceKeys as RumaDeviceKeys, serde::Raw,
+        };
+
+        let user_id = user_id!("@alice:example.org");
+        let device_id = device_id!("DEVICE");
+        let raw = Raw::<RumaDeviceKeys>::from_json_string(
+            json!({
+                "user_id": user_id,
+                "device_id": device_id,
+                "algorithms": [],
+                "keys": {},
+                "signatures": {},
+                "com.example.server_extension": true
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let mut response = Response::new();
+        response
+            .device_keys
+            .entry(user_id.to_owned())
+            .or_default()
+            .insert(device_id.to_owned(), raw);
+
+        let selected = own_device_keys_from_response(&response, user_id, device_id).unwrap();
+        let selected: serde_json::Value = serde_json::from_str(selected.json().get()).unwrap();
+        assert_eq!(selected["com.example.server_extension"], true);
     }
 
     #[async_test]

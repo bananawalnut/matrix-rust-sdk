@@ -26,6 +26,7 @@ use ruma::{
     DeviceId, DeviceKeyAlgorithm, DeviceKeyId, MilliSecondsSinceUnixEpoch, OwnedDeviceId,
     OwnedDeviceKeyId, UInt, UserId,
     api::client::keys::upload_signatures::v3::Request as SignatureUploadRequest,
+    encryption::DeviceKeys as RumaDeviceKeys,
     events::{AnyToDeviceEventContent, key::verification::VerificationMethod},
     serde::Raw,
 };
@@ -420,6 +421,23 @@ impl Device {
             signed_object_matches_server_device: diagnostics.signed_object_matches_device,
             generated_signature_valid: diagnostics.generated_signature_valid,
         })
+    }
+
+    pub async fn prepare_raw_signature_with_diagnostics(
+        &self,
+        raw: Raw<RumaDeviceKeys>,
+    ) -> Result<DeviceSignaturePreparation, SignatureError> {
+        let mut diagnostics = self.prepare_signature_with_diagnostics().await?;
+        diagnostics.request = self
+            .verification_machine
+            .store
+            .private_identity
+            .lock()
+            .await
+            .sign_raw_device_keys(raw)
+            .await?;
+        diagnostics.signed_object_matches_server_device = true;
+        Ok(diagnostics)
     }
 
     /// Set the local trust state of the device to the given state.

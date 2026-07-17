@@ -257,6 +257,7 @@ pub enum DiagnosticUploadTransport {
 #[derive(uniffi::Enum)]
 pub enum DiagnosticUploadProcessing {
     Accepted,
+    KeyMismatch,
     InvalidSignature,
     OtherFailure,
 }
@@ -743,7 +744,10 @@ impl Encryption {
             .await
             .map_err(ClientError::from_err)?
             .ok_or_else(|| ClientError::from_str("Own device is unavailable", None))?;
-        let diagnostics = device.verify_with_diagnostics().await.map_err(ClientError::from_err)?;
+        let raw_device =
+            self.inner.request_own_device_keys_raw().await.map_err(ClientError::from_err)?;
+        let diagnostics =
+            device.verify_raw_with_diagnostics(raw_device).await.map_err(ClientError::from_err)?;
         let upload_transport = match diagnostics.upload_transport {
             matrix_sdk::encryption::identities::SignatureUploadTransport::Accepted => {
                 DiagnosticUploadTransport::Accepted
@@ -755,6 +759,9 @@ impl Encryption {
         let upload_processing = match diagnostics.upload_processing {
             matrix_sdk::encryption::identities::SignatureUploadProcessing::Accepted => {
                 DiagnosticUploadProcessing::Accepted
+            }
+            matrix_sdk::encryption::identities::SignatureUploadProcessing::KeyMismatch => {
+                DiagnosticUploadProcessing::KeyMismatch
             }
             matrix_sdk::encryption::identities::SignatureUploadProcessing::InvalidSignature => {
                 DiagnosticUploadProcessing::InvalidSignature

@@ -88,8 +88,9 @@ pub use file_encryption::{
 };
 pub use gossiping::{GossipRequest, GossippedSecret};
 pub use identities::{
-    Device, DeviceData, LocalTrust, OtherUserIdentity, OtherUserIdentityData, OwnUserIdentity,
-    OwnUserIdentityData, UserDevices, UserIdentity, UserIdentityData,
+    Device, DeviceData, DeviceSignaturePreparation, LocalTrust, OtherUserIdentity,
+    OtherUserIdentityData, OwnUserIdentity, OwnUserIdentityData, UserDevices, UserIdentity,
+    UserIdentityData,
 };
 pub use machine::{
     BootstrapCrossSigningError, CrossSigningBootstrapRequests, EncryptionSyncChanges, OlmMachine,

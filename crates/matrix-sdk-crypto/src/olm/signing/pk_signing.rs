@@ -267,6 +267,30 @@ impl UserSigning {
 }
 
 impl SelfSigning {
+    pub(crate) fn sign_raw_device_json(
+        &self,
+        value: &mut serde_json::Value,
+    ) -> Result<(), SignatureError> {
+        let serialized = to_canonical_value(&*value)?;
+        let signature = self.inner.sign_json(serialized)?;
+        let object = value.as_object_mut().ok_or(SignatureError::NotAnObject)?;
+        let signatures = object
+            .entry("signatures")
+            .or_insert_with(|| serde_json::json!({}))
+            .as_object_mut()
+            .ok_or(SignatureError::NotAnObject)?;
+        let user_signatures = signatures
+            .entry(self.public_key.user_id().as_str())
+            .or_insert_with(|| serde_json::json!({}))
+            .as_object_mut()
+            .ok_or(SignatureError::NotAnObject)?;
+        user_signatures.insert(
+            format!("ed25519:{}", self.inner.public_key.to_base64()),
+            serde_json::Value::String(signature.to_base64()),
+        );
+        Ok(())
+    }
+
     pub(crate) fn pickle(&self) -> PickledSelfSigning {
         let pickle = self.inner.pickle();
         let public_key = self.public_key.clone();

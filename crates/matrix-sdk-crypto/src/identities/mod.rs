@@ -50,7 +50,7 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
 };
 
-pub use device::{Device, DeviceData, LocalTrust, UserDevices};
+pub use device::{Device, DeviceData, DeviceSignaturePreparation, LocalTrust, UserDevices};
 pub(crate) use manager::IdentityManager;
 use serde::{Deserialize, Deserializer, Serializer};
 pub use user::{
