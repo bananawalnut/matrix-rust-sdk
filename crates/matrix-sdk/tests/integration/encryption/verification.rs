@@ -2,7 +2,7 @@ use assert_matches2::assert_matches;
 use futures_util::FutureExt;
 use matrix_sdk::{
     Client,
-    encryption::VerificationState,
+    encryption::{VerificationState, identities::AuthoritativeDeviceVerificationState},
     test_utils::{logged_in_client_with_server, mocks::MatrixMockServer},
 };
 use matrix_sdk_test::async_test;
@@ -18,6 +18,125 @@ async fn bootstrap_cross_signing(client: &Client) {
 
     let status = client.encryption().cross_signing_status().await.unwrap();
     assert!(status.is_complete());
+}
+
+#[async_test]
+async fn test_authoritative_own_device_query_classifies_verified() {
+    let server = MatrixMockServer::new().await;
+    server.mock_crypto_endpoints_preset().await;
+
+    let user_id = owned_user_id!("@alice:example.org");
+    let device_id = owned_device_id!("4L1C3");
+    let alice = server.client_builder_for_crypto_end_to_end(&user_id, &device_id).build().await;
+    bootstrap_cross_signing(&alice).await;
+
+    assert_eq!(
+        alice.encryption().request_own_device_verification_state().await.unwrap(),
+        AuthoritativeDeviceVerificationState::VerifiedByCurrentSelfSigningKey
+    );
+}
+
+#[async_test]
+async fn test_authoritative_own_device_query_classifies_unsigned() {
+    let server = MatrixMockServer::new().await;
+    server.mock_crypto_endpoints_preset().await;
+
+    let user_id = owned_user_id!("@alice:example.org");
+    let device_id = owned_device_id!("4L1C3");
+    let alice = server.client_builder_for_crypto_end_to_end(&user_id, &device_id).build().await;
+    bootstrap_cross_signing(&alice).await;
+    let raw = alice.encryption().request_own_device_keys_raw().await.unwrap();
+    let mut device: serde_json::Value = serde_json::from_str(raw.json().get()).unwrap();
+    device["signatures"] = json!({});
+    device["com.example.server_extension"] = json!(true);
+
+    let response = json!({
+        "device_keys": { user_id.as_str(): { device_id.as_str(): device } },
+        "failures": {}
+    });
+    let _mock = Mock::given(method("POST"))
+        .and(path("/_matrix/client/v3/keys/query"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(response))
+        .with_priority(1)
+        .expect(1)
+        .mount_as_scoped(&server)
+        .await;
+
+    assert_eq!(
+        alice.encryption().request_own_device_verification_state().await.unwrap(),
+        AuthoritativeDeviceVerificationState::Unsigned
+    );
+}
+
+#[async_test]
+async fn test_authoritative_own_device_query_classifies_invalid_current_signature() {
+    let server = MatrixMockServer::new().await;
+    server.mock_crypto_endpoints_preset().await;
+
+    let user_id = owned_user_id!("@alice:example.org");
+    let device_id = owned_device_id!("4L1C3");
+    let alice = server.client_builder_for_crypto_end_to_end(&user_id, &device_id).build().await;
+    bootstrap_cross_signing(&alice).await;
+    let raw = alice.encryption().request_own_device_keys_raw().await.unwrap();
+    let mut device: serde_json::Value = serde_json::from_str(raw.json().get()).unwrap();
+    let signatures = device["signatures"][user_id.as_str()].as_object_mut().unwrap();
+    for signature in signatures.values_mut() {
+        *signature = json!("invalid-current-key-signature");
+    }
+    device["com.example.server_extension"] = json!(true);
+
+    let response = json!({
+        "device_keys": { user_id.as_str(): { device_id.as_str(): device } },
+        "failures": {}
+    });
+    let _mock = Mock::given(method("POST"))
+        .and(path("/_matrix/client/v3/keys/query"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(response))
+        .with_priority(1)
+        .expect(1)
+        .mount_as_scoped(&server)
+        .await;
+
+    assert_eq!(
+        alice.encryption().request_own_device_verification_state().await.unwrap(),
+        AuthoritativeDeviceVerificationState::InvalidSignature
+    );
+}
+
+#[async_test]
+async fn test_authoritative_own_device_query_is_unavailable_without_current_identity() {
+    let server = MatrixMockServer::new().await;
+    server.mock_crypto_endpoints_preset().await;
+
+    let user_id = owned_user_id!("@alice:example.org");
+    let device_id = owned_device_id!("4L1C3");
+    let alice = server.client_builder_for_crypto_end_to_end(&user_id, &device_id).build().await;
+    let response = json!({
+        "device_keys": {
+            user_id.as_str(): {
+                device_id.as_str(): {
+                    "user_id": user_id,
+                    "device_id": device_id,
+                    "algorithms": [],
+                    "keys": {},
+                    "signatures": {}
+                }
+            }
+        },
+        "failures": {}
+    });
+    let _mock = Mock::given(method("POST"))
+        .and(path("/_matrix/client/v3/keys/query"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(response))
+        .with_priority(1)
+        .expect(1)
+        .mount_as_scoped(&server)
+        .await;
+
+    assert_eq!(
+        alice.encryption().request_own_device_verification_state().await.unwrap(),
+        AuthoritativeDeviceVerificationState::Unavailable
+    );
 }
 
 #[async_test]

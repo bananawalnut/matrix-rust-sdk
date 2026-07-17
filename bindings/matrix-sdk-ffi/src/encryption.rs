@@ -1116,3 +1116,21 @@ impl From<&matrix_sdk::encryption::OAuthCrossSigningResetInfo> for OAuthCrossSig
         Self { approval_url: value.approval_url.to_string() }
     }
 }
+
+#[cfg(test)]
+mod authoritative_device_verification_tests {
+    use matrix_sdk::encryption::identities::AuthoritativeDeviceVerificationState as SdkState;
+
+    use super::AuthoritativeDeviceVerificationState as FfiState;
+
+    #[test]
+    fn maps_every_authoritative_device_verification_state_across_ffi() {
+        assert!(matches!(
+            FfiState::from(SdkState::VerifiedByCurrentSelfSigningKey),
+            FfiState::VerifiedByCurrentSelfSigningKey
+        ));
+        assert!(matches!(FfiState::from(SdkState::Unsigned), FfiState::Unsigned));
+        assert!(matches!(FfiState::from(SdkState::InvalidSignature), FfiState::InvalidSignature));
+        assert!(matches!(FfiState::from(SdkState::Unavailable), FfiState::Unavailable));
+    }
+}
