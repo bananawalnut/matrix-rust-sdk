@@ -12,6 +12,18 @@ use crate::{
     types::{DeviceKeys, Signatures, SigningKeys},
 };
 
+/// Classification of a raw device object's signature under the current
+/// public self-signing key.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RawDeviceSignatureState {
+    /// The exact current self-signing key produced a valid signature.
+    Verified,
+    /// No signature exists under the exact current self-signing key ID.
+    Unsigned,
+    /// A current-key signature exists but does not verify.
+    InvalidSignature,
+}
+
 /// Wrapper for a cross signing key marking it as a self signing key.
 ///
 /// Self signing keys are used to sign the user's own devices.
@@ -53,8 +65,12 @@ impl SelfSigningPubkey {
         }
     }
 
-    /// Verify raw device keys without discarding server-provided extension fields.
-    pub fn verify_raw_device_keys(&self, device_keys: &RawValue) -> Result<(), SignatureError> {
+    /// Classify a raw device object's signature under this exact self-signing
+    /// key without discarding server-provided extension fields.
+    pub fn classify_raw_device_keys(
+        &self,
+        device_keys: &RawValue,
+    ) -> Result<RawDeviceSignatureState, SignatureError> {
         #[derive(Deserialize)]
         struct RawSignatures {
             signatures: Signatures,
@@ -62,18 +78,38 @@ impl SelfSigningPubkey {
 
         let signatures: RawSignatures = serde_json::from_str(device_keys.get())
             .map_err(ruma::canonical_json::CanonicalJsonError::InvalidRawValue)?;
+        let Some((key_id, key)) = self.0.get_first_key_and_id() else {
+            return Err(SignatureError::UnsupportedAlgorithm);
+        };
+        if signatures
+            .signatures
+            .get(&self.0.user_id)
+            .and_then(|user_signatures| user_signatures.get(key_id))
+            .is_none()
+        {
+            return Ok(RawDeviceSignatureState::Unsigned);
+        }
+
         let device_keys: CanonicalJsonValue = serde_json::from_str(device_keys.get())
             .map_err(ruma::canonical_json::CanonicalJsonError::InvalidRawValue)?;
         let canonical_json = to_signable_json(device_keys)?;
-        if let Some((key_id, key)) = self.0.get_first_key_and_id() {
-            key.verify_canonicalized_json(
-                &self.0.user_id,
-                key_id,
-                &signatures.signatures,
-                &canonical_json,
-            )
-        } else {
-            Err(SignatureError::UnsupportedAlgorithm)
+        match key.verify_canonicalized_json(
+            &self.0.user_id,
+            key_id,
+            &signatures.signatures,
+            &canonical_json,
+        ) {
+            Ok(()) => Ok(RawDeviceSignatureState::Verified),
+            Err(_) => Ok(RawDeviceSignatureState::InvalidSignature),
+        }
+    }
+
+    /// Verify raw device keys without discarding server-provided extension fields.
+    pub fn verify_raw_device_keys(&self, device_keys: &RawValue) -> Result<(), SignatureError> {
+        match self.classify_raw_device_keys(device_keys)? {
+            RawDeviceSignatureState::Verified => Ok(()),
+            RawDeviceSignatureState::Unsigned => Err(SignatureError::NoSignatureFound),
+            RawDeviceSignatureState::InvalidSignature => Err(SignatureError::InvalidSignature),
         }
     }
 

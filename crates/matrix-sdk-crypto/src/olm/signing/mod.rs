@@ -743,7 +743,7 @@ mod tests {
     use crate::{
         identities::{DeviceData, OtherUserIdentityData, OwnUserIdentityData},
         olm::{Account, SignedJsonObject, VerifyJson},
-        types::Signatures,
+        types::{RawDeviceSignatureState, Signatures},
     };
 
     fn user_id() -> &'static UserId {
@@ -924,17 +924,66 @@ mod tests {
         let public_identity = OwnUserIdentityData::from_private(&identity).await;
         public_identity
             .self_signing_key()
-            .verify_raw_device_keys(signed)
+            .classify_raw_device_keys(signed)
+            .is_ok_and(|state| state == RawDeviceSignatureState::Verified)
+            .then_some(())
             .expect("the current public self-signing key must verify the raw signed device");
         let stale_identity = PrivateCrossSigningIdentity::new(user_id().to_owned());
         let stale_public_identity = OwnUserIdentityData::from_private(&stale_identity).await;
-        assert!(stale_public_identity.self_signing_key().verify_raw_device_keys(signed).is_err());
+        assert_eq!(
+            stale_public_identity.self_signing_key().classify_raw_device_keys(signed).unwrap(),
+            RawDeviceSignatureState::Unsigned
+        );
         let signed: serde_json::Value = serde_json::from_str(signed.get()).unwrap();
 
         assert_eq!(signed["com.example.server_extension"]["must"], "survive");
         assert_eq!(signed["unsigned"]["device_display_name"], "Zenith");
         assert!(
             signed["signatures"][user_id().as_str()].as_object().is_some_and(|v| !v.is_empty())
+        );
+    }
+
+    #[async_test]
+    async fn test_raw_device_signature_classifies_unsigned_and_invalid_current_signatures() {
+        use ruma::{encryption::DeviceKeys as RumaDeviceKeys, serde::Raw};
+
+        let identity = PrivateCrossSigningIdentity::new(user_id().to_owned());
+        let public_identity = OwnUserIdentityData::from_private(&identity).await;
+        let unsigned = Raw::<RumaDeviceKeys>::from_json_string(
+            serde_json::json!({
+                "user_id": user_id(),
+                "device_id": "DEVICEID",
+                "algorithms": ["m.olm.v1.curve25519-aes-sha2"],
+                "keys": {
+                    "curve25519:DEVICEID": "curve",
+                    "ed25519:DEVICEID": "ed"
+                },
+                "signatures": {},
+                "unsigned": {"device_display_name": "Zenith"}
+            })
+            .to_string(),
+        )
+        .unwrap();
+        assert_eq!(
+            public_identity
+                .self_signing_key()
+                .classify_raw_device_keys(unsigned.json())
+                .unwrap(),
+            RawDeviceSignatureState::Unsigned
+        );
+
+        let request = identity.sign_raw_device_keys(unsigned).await.unwrap();
+        let signed = request.signed_keys.get(user_id()).unwrap().iter().next().unwrap().1;
+        let mut invalid: serde_json::Value = serde_json::from_str(signed.get()).unwrap();
+        let signatures = invalid["signatures"][user_id().as_str()].as_object_mut().unwrap();
+        *signatures.values_mut().next().unwrap() = serde_json::Value::String("invalid".into());
+        let invalid = serde_json::value::to_raw_value(&invalid).unwrap();
+        assert_eq!(
+            public_identity
+                .self_signing_key()
+                .classify_raw_device_keys(&invalid)
+                .unwrap(),
+            RawDeviceSignatureState::InvalidSignature
         );
     }
 
