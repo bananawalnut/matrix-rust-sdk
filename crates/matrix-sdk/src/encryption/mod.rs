@@ -1378,6 +1378,19 @@ impl Encryption {
         own_device_keys_from_response(&response, user_id, device_id).ok_or(Error::InsufficientData)
     }
 
+    /// Fetch and classify the current own device using the current public
+    /// self-signing identity established by the same fresh keys query.
+    pub async fn request_own_device_verification_state(
+        &self,
+    ) -> Result<identities::AuthoritativeDeviceVerificationState> {
+        let user_id = self.client.user_id().ok_or(Error::AuthenticationRequired)?.to_owned();
+        let raw_device = self.request_own_device_keys_raw().await?;
+        let identity = self.get_user_identity(&user_id).await?;
+        Ok(identity
+            .map(|identity| identity.classify_raw_device_keys(&raw_device))
+            .unwrap_or(identities::AuthoritativeDeviceVerificationState::Unavailable))
+    }
+
     /// Returns a stream of device updates, allowing users to listen for
     /// notifications about new or changed devices.
     ///

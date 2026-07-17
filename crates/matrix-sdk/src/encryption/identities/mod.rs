@@ -92,7 +92,7 @@ pub use devices::{
     SignatureUploadTransport, UserDevices,
 };
 pub use matrix_sdk_base::crypto::types::MasterPubkey;
-pub use users::{IdentityUpdates, UserIdentity};
+pub use users::{AuthoritativeDeviceVerificationState, IdentityUpdates, UserIdentity};
 
 /// Error for the manual verification step, when we manually sign users or
 /// devices.

@@ -16,7 +16,10 @@ use std::collections::BTreeMap;
 
 use matrix_sdk_base::{
     RoomMemberships,
-    crypto::{CryptoStoreError, UserIdentity as CryptoUserIdentity, types::MasterPubkey},
+    crypto::{
+        CryptoStoreError, UserIdentity as CryptoUserIdentity,
+        types::{MasterPubkey, RawDeviceSignatureState},
+    },
 };
 use ruma::{
     OwnedUserId, UserId,
@@ -60,6 +63,33 @@ impl IdentityUpdates {
             .collect();
 
         Self { new, changed }
+    }
+}
+
+/// Authoritative own-device trust derived from a fresh raw keys query.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AuthoritativeDeviceVerificationState {
+    /// The current public self-signing key has a valid signature on the device.
+    VerifiedByCurrentSelfSigningKey,
+    /// No signature exists under the current self-signing key ID.
+    Unsigned,
+    /// A current-key signature exists but is invalid.
+    InvalidSignature,
+    /// The current own-user identity or raw device authority is unavailable.
+    Unavailable,
+}
+
+fn authoritative_state_from_raw(
+    state: RawDeviceSignatureState,
+) -> AuthoritativeDeviceVerificationState {
+    match state {
+        RawDeviceSignatureState::Verified => {
+            AuthoritativeDeviceVerificationState::VerifiedByCurrentSelfSigningKey
+        }
+        RawDeviceSignatureState::Unsigned => AuthoritativeDeviceVerificationState::Unsigned,
+        RawDeviceSignatureState::InvalidSignature => {
+            AuthoritativeDeviceVerificationState::InvalidSignature
+        }
     }
 }
 
@@ -138,15 +168,27 @@ impl UserIdentity {
         }
     }
 
+    /// Classify raw device keys against this account's current public
+    /// self-signing key.
+    pub fn classify_raw_device_keys(
+        &self,
+        device_keys: &Raw<RumaDeviceKeys>,
+    ) -> AuthoritativeDeviceVerificationState {
+        match &self.inner {
+            CryptoUserIdentity::Own(identity) => identity
+                .self_signing_key()
+                .classify_raw_device_keys(device_keys.json())
+                .map(authoritative_state_from_raw)
+                .unwrap_or(AuthoritativeDeviceVerificationState::Unavailable),
+            CryptoUserIdentity::Other(_) => AuthoritativeDeviceVerificationState::Unavailable,
+        }
+    }
+
     /// Verify that raw device keys carry a valid signature from this account's
     /// current public self-signing key.
     pub fn verifies_raw_device_keys(&self, device_keys: &Raw<RumaDeviceKeys>) -> bool {
-        match &self.inner {
-            CryptoUserIdentity::Own(identity) => {
-                identity.self_signing_key().verify_raw_device_keys(device_keys.json()).is_ok()
-            }
-            CryptoUserIdentity::Other(_) => false,
-        }
+        self.classify_raw_device_keys(device_keys)
+            == AuthoritativeDeviceVerificationState::VerifiedByCurrentSelfSigningKey
     }
 
     /// Request an interactive verification with this `UserIdentity`.
@@ -507,5 +549,26 @@ impl UserIdentity {
             CryptoUserIdentity::Own(identity) => identity.master_key(),
             CryptoUserIdentity::Other(identity) => identity.master_key(),
         }
+    }
+}
+
+#[cfg(test)]
+mod authoritative_verification_tests {
+    use matrix_sdk_base::crypto::types::RawDeviceSignatureState;
+
+    #[test]
+    fn authoritative_device_verification_maps_all_raw_signature_states() {
+        assert_eq!(
+            super::authoritative_state_from_raw(RawDeviceSignatureState::Verified),
+            super::AuthoritativeDeviceVerificationState::VerifiedByCurrentSelfSigningKey
+        );
+        assert_eq!(
+            super::authoritative_state_from_raw(RawDeviceSignatureState::Unsigned),
+            super::AuthoritativeDeviceVerificationState::Unsigned
+        );
+        assert_eq!(
+            super::authoritative_state_from_raw(RawDeviceSignatureState::InvalidSignature),
+            super::AuthoritativeDeviceVerificationState::InvalidSignature
+        );
     }
 }

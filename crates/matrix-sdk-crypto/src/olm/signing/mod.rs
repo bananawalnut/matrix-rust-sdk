@@ -965,10 +965,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            public_identity
-                .self_signing_key()
-                .classify_raw_device_keys(unsigned.json())
-                .unwrap(),
+            public_identity.self_signing_key().classify_raw_device_keys(unsigned.json()).unwrap(),
             RawDeviceSignatureState::Unsigned
         );
 
@@ -979,10 +976,7 @@ mod tests {
         *signatures.values_mut().next().unwrap() = serde_json::Value::String("invalid".into());
         let invalid = serde_json::value::to_raw_value(&invalid).unwrap();
         assert_eq!(
-            public_identity
-                .self_signing_key()
-                .classify_raw_device_keys(&invalid)
-                .unwrap(),
+            public_identity.self_signing_key().classify_raw_device_keys(&invalid).unwrap(),
             RawDeviceSignatureState::InvalidSignature
         );
     }

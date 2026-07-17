@@ -255,6 +255,30 @@ pub enum DiagnosticUploadTransport {
 }
 
 #[derive(uniffi::Enum)]
+pub enum AuthoritativeDeviceVerificationState {
+    VerifiedByCurrentSelfSigningKey,
+    Unsigned,
+    InvalidSignature,
+    Unavailable,
+}
+
+impl From<matrix_sdk::encryption::identities::AuthoritativeDeviceVerificationState>
+    for AuthoritativeDeviceVerificationState
+{
+    fn from(
+        value: matrix_sdk::encryption::identities::AuthoritativeDeviceVerificationState,
+    ) -> Self {
+        use matrix_sdk::encryption::identities::AuthoritativeDeviceVerificationState as SdkState;
+        match value {
+            SdkState::VerifiedByCurrentSelfSigningKey => Self::VerifiedByCurrentSelfSigningKey,
+            SdkState::Unsigned => Self::Unsigned,
+            SdkState::InvalidSignature => Self::InvalidSignature,
+            SdkState::Unavailable => Self::Unavailable,
+        }
+    }
+}
+
+#[derive(uniffi::Enum)]
 pub enum DiagnosticUploadProcessing {
     Accepted,
     KeyMismatch,
@@ -770,14 +794,12 @@ impl Encryption {
                 DiagnosticUploadProcessing::OtherFailure
             }
         };
-        let post_upload_raw_device =
-            self.inner.request_own_device_keys_raw().await.map_err(ClientError::from_err)?;
         let post_upload_server_signature_present = self
             .inner
-            .get_user_identity(user_id.as_str().try_into()?)
+            .request_own_device_verification_state()
             .await
             .map_err(ClientError::from_err)?
-            .is_some_and(|identity| identity.verifies_raw_device_keys(&post_upload_raw_device));
+            == matrix_sdk::encryption::identities::AuthoritativeDeviceVerificationState::VerifiedByCurrentSelfSigningKey;
 
         Ok(CrossSigningDiagnosticReceipt {
             public_identity_refreshed: true,
@@ -793,6 +815,18 @@ impl Encryption {
             upload_processing,
             post_upload_server_signature_present,
         })
+    }
+
+    /// Query and cryptographically classify the current own device using the
+    /// current public self-signing identity. No identifiers or signatures cross FFI.
+    pub async fn authoritative_device_verification_state(
+        &self,
+    ) -> Result<AuthoritativeDeviceVerificationState, ClientError> {
+        self.inner
+            .request_own_device_verification_state()
+            .await
+            .map(Into::into)
+            .map_err(ClientError::from_err)
     }
 
     /// Sign this device with the recovered private self-signing key and upload
