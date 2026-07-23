@@ -130,12 +130,36 @@ pub struct Device {
     pub(crate) device_owner_identity: Option<UserIdentityData>,
 }
 
+/// A prepared own-device signature upload plus non-secret consistency checks.
+///
+/// The request is intentionally omitted from the `Debug` representation because
+/// it contains signature material.
 pub struct DeviceSignaturePreparation {
+    /// The signature upload request that must be sent to the homeserver.
     pub request: SignatureUploadRequest,
+    /// Whether the local private self-signing key matches the public identity.
     pub private_key_matches_public_identity: bool,
+    /// Whether locally cached device keys match the queried server device.
     pub local_device_keys_match_server_device: bool,
+    /// Whether the object signed locally matches the queried server device.
     pub signed_object_matches_server_device: bool,
+    /// Whether the generated signature verifies against the public identity.
     pub generated_signature_valid: bool,
+}
+
+#[cfg(not(tarpaulin_include))]
+impl std::fmt::Debug for DeviceSignaturePreparation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DeviceSignaturePreparation")
+            .field("private_key_matches_public_identity", &self.private_key_matches_public_identity)
+            .field(
+                "local_device_keys_match_server_device",
+                &self.local_device_keys_match_server_device,
+            )
+            .field("signed_object_matches_server_device", &self.signed_object_matches_server_device)
+            .field("generated_signature_valid", &self.generated_signature_valid)
+            .finish_non_exhaustive()
+    }
 }
 
 #[cfg(not(tarpaulin_include))]
@@ -398,6 +422,7 @@ impl Device {
         }
     }
 
+    /// Prepare an own-device signature and report non-secret consistency checks.
     pub async fn prepare_signature_with_diagnostics(
         &self,
     ) -> Result<DeviceSignaturePreparation, SignatureError> {
@@ -423,6 +448,8 @@ impl Device {
         })
     }
 
+    /// Prepare a signature over the exact queried device JSON and report
+    /// non-secret consistency checks.
     pub async fn prepare_raw_signature_with_diagnostics(
         &self,
         raw: Raw<RumaDeviceKeys>,

@@ -109,25 +109,41 @@ pub struct Device {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// Whether the signature upload request reached and was accepted by the server.
 pub enum SignatureUploadTransport {
+    /// The homeserver returned a successful HTTP response.
     Accepted,
+    /// The request failed before a successful HTTP response was received.
     Failed,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// The per-key result reported inside a successful signature upload response.
 pub enum SignatureUploadProcessing {
+    /// The response contained no per-key failures.
     Accepted,
+    /// The homeserver rejected the signature because the key did not match.
     KeyMismatch,
+    /// The homeserver rejected an invalid signature.
     InvalidSignature,
+    /// The response contained another per-key failure.
     OtherFailure,
 }
 
+/// Non-secret diagnostics for one own-device signature upload attempt.
+#[derive(Debug)]
 pub struct DeviceSignatureDiagnostic {
+    /// Whether the local private self-signing key matches the public identity.
     pub private_key_matches_public_identity: bool,
+    /// Whether locally cached device keys match the queried server device.
     pub local_device_keys_match_server_device: bool,
+    /// Whether the object signed locally matches the queried server device.
     pub signed_object_matches_server_device: bool,
+    /// Whether the generated signature verifies against the public identity.
     pub generated_signature_valid: bool,
+    /// Whether the upload transport itself succeeded.
     pub upload_transport: SignatureUploadTransport,
+    /// How the homeserver processed the uploaded signature.
     pub upload_processing: SignatureUploadProcessing,
 }
 
@@ -358,6 +374,8 @@ impl Device {
         Ok(())
     }
 
+    /// Sign the locally cached own device, upload the signature, and return
+    /// non-secret diagnostics for the attempt.
     pub async fn verify_with_diagnostics(
         &self,
     ) -> Result<DeviceSignatureDiagnostic, ManualVerifyError> {
@@ -365,6 +383,8 @@ impl Device {
         self.send_prepared_diagnostic(prepared).await
     }
 
+    /// Sign the exact own-device JSON queried from the server, upload the
+    /// signature, and return non-secret diagnostics for the attempt.
     pub async fn verify_raw_with_diagnostics(
         &self,
         raw: Raw<RumaDeviceKeys>,
