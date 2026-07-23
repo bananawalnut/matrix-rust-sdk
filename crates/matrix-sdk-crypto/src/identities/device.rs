@@ -426,9 +426,9 @@ impl Device {
     pub async fn prepare_signature_with_diagnostics(
         &self,
     ) -> Result<DeviceSignaturePreparation, SignatureError> {
-        let public_identity = match self.device_owner_identity.as_ref() {
-            Some(UserIdentityData::Own(identity)) => identity,
-            _ => return Err(SignatureError::MissingSigningKey),
+        let Some(UserIdentityData::Own(public_identity)) = self.device_owner_identity.as_ref()
+        else {
+            return Err(SignatureError::MissingSigningKey);
         };
         let diagnostics = self
             .verification_machine
