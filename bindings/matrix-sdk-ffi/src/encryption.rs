@@ -22,7 +22,7 @@ use ruma::OwnedUserId;
 use serde::de::Error;
 use thiserror::Error;
 use tracing::{error, info};
-use zeroize::Zeroize;
+use zeroize::{Zeroize, Zeroizing};
 
 use crate::{
     client::{Client, UiaaChallenge},
@@ -1071,6 +1071,21 @@ impl IdentityResetHandle {
         self.inner.auth_type().into()
     }
 
+    /// Continue a UIAA-backed identity reset with password authentication.
+    /// The SDK derives the current user and attaches the retained UIAA session;
+    /// the generated binding does not retain or print the password.
+    pub async fn reset_with_password(
+        &self,
+        password: String,
+    ) -> Result<Option<UiaaChallenge>, ClientError> {
+        let password = Zeroizing::new(password);
+        self.inner
+            .reset_with_password(password.as_str())
+            .await
+            .map_err(ClientError::from_err)
+            .map(|challenge| challenge.as_ref().map(UiaaChallenge::from))
+    }
+
     /// This method starts the identity reset process and
     /// will go through the following steps:
     ///
@@ -1082,8 +1097,8 @@ impl IdentityResetHandle {
         self.inner.reset(auth.map(Into::into)).await.map_err(ClientError::from_err)
     }
 
-    pub async fn cancel(&self) {
-        self.inner.cancel().await;
+    pub async fn cancel(&self) -> bool {
+        self.inner.cancel().await
     }
 }
 
@@ -1122,6 +1137,22 @@ mod authoritative_device_verification_tests {
     use matrix_sdk::encryption::identities::AuthoritativeDeviceVerificationState as SdkState;
 
     use super::AuthoritativeDeviceVerificationState as FfiState;
+
+    #[test]
+    fn identity_reset_password_is_owned_by_a_drop_safe_zeroizing_guard() {
+        let source = include_str!("encryption.rs");
+        let start = source
+            .find("pub async fn reset_with_password(")
+            .expect("identity reset password continuation must exist");
+        let end = source[start..]
+            .find("    /// This method starts the identity reset process")
+            .map(|offset| start + offset)
+            .expect("identity reset password continuation must have a bounded source region");
+        let method = &source[start..end];
+
+        assert!(method.contains("Zeroizing::new(password)"));
+        assert!(!method.contains("password.zeroize()"));
+    }
 
     #[test]
     fn maps_every_authoritative_device_verification_state_across_ffi() {

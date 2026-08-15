@@ -68,9 +68,11 @@ use ruma::{
             to_device::send_event_to_device::v3::{
                 Request as RumaToDeviceRequest, Response as ToDeviceResponse,
             },
-            uiaa::{AuthData, AuthType, OAuthParams, Password as UiaaPassword, UiaaInfo},
+            uiaa::{
+                AuthData, AuthType, OAuthParams, Password as UiaaPassword, UiaaInfo, UiaaResponse,
+            },
         },
-        error::{ErrorBody, StandardErrorBody},
+        error::{ErrorBody, FromHttpResponseError, StandardErrorBody},
     },
     assign,
     encryption::DeviceKeys as RumaDeviceKeys,
@@ -424,7 +426,22 @@ pub struct CrossSigningResetHandle {
     upload_request: UploadSigningKeysRequest,
     signatures_request: UploadSignaturesRequest,
     auth_type: CrossSigningResetAuthType,
-    is_cancelled: Mutex<bool>,
+    password_state: Mutex<Option<CrossSigningResetPasswordState>>,
+    oauth_state: Mutex<Option<CrossSigningResetOAuthState>>,
+    oauth_operation_lock: Mutex<()>,
+}
+
+#[derive(Debug)]
+enum CrossSigningResetPasswordState {
+    Active { state: CrossSigningBootstrapState, mutation_admitted: bool },
+    Cancelled,
+}
+
+#[derive(Debug)]
+enum CrossSigningResetOAuthState {
+    Active { mutation_admitted: bool },
+    Cancelled,
+    Complete,
 }
 
 impl CrossSigningResetHandle {
@@ -435,12 +452,32 @@ impl CrossSigningResetHandle {
         signatures_request: UploadSignaturesRequest,
         auth_type: CrossSigningResetAuthType,
     ) -> Self {
+        let password_state = match &auth_type {
+            CrossSigningResetAuthType::Uiaa(challenge) => {
+                Some(CrossSigningResetPasswordState::Active {
+                    state: CrossSigningBootstrapState {
+                        challenge: challenge.clone(),
+                        phase: CrossSigningBootstrapPhase::SigningKeys,
+                    },
+                    mutation_admitted: false,
+                })
+            }
+            CrossSigningResetAuthType::OAuth(_) => None,
+        };
+        let oauth_state = match &auth_type {
+            CrossSigningResetAuthType::Uiaa(_) => None,
+            CrossSigningResetAuthType::OAuth(_) => {
+                Some(CrossSigningResetOAuthState::Active { mutation_admitted: false })
+            }
+        };
         Self {
             client,
             upload_request,
             signatures_request,
             auth_type,
-            is_cancelled: Mutex::new(false),
+            password_state: Mutex::new(password_state),
+            oauth_state: Mutex::new(oauth_state),
+            oauth_operation_lock: Mutex::new(()),
         }
     }
 
@@ -450,10 +487,87 @@ impl CrossSigningResetHandle {
         &self.auth_type
     }
 
+    /// Continue a UIAA-backed cross-signing reset using password authentication.
+    ///
+    /// The retained UIAA session is attached internally. Returns an updated
+    /// challenge when authentication is rejected and `None` after both the
+    /// signing keys and device signatures are uploaded.
+    pub async fn auth_with_password(&self, password: &str) -> Result<Option<UiaaInfo>> {
+        let mut password_state = self.password_state.lock().await;
+        let (state, mutation_admitted) = match password_state.as_mut() {
+            Some(CrossSigningResetPasswordState::Active { state, mutation_admitted }) => {
+                (state, mutation_admitted)
+            }
+            Some(CrossSigningResetPasswordState::Cancelled) | None => {
+                return Err(Error::AuthenticationRequired);
+            }
+        };
+        if state.phase == CrossSigningBootstrapPhase::Complete {
+            return Ok(None);
+        }
+        if state.phase == CrossSigningBootstrapPhase::Signatures {
+            *mutation_admitted = true;
+            self.client.send(self.signatures_request.clone()).await?;
+            state.phase = CrossSigningBootstrapPhase::Complete;
+            return Ok(None);
+        }
+
+        let user_id = self.client.user_id().ok_or(Error::AuthenticationRequired)?.to_owned();
+        let mut auth = UiaaPassword::new(user_id.into(), password.to_owned());
+        auth.session = state.challenge.session.clone();
+
+        let mut upload_request = self.upload_request.clone();
+        upload_request.auth = Some(AuthData::Password(auth));
+
+        *mutation_admitted = true;
+        match self.client.send(upload_request).await {
+            Ok(_) => {
+                state.phase = CrossSigningBootstrapPhase::Signatures;
+                self.client.send(self.signatures_request.clone()).await?;
+                state.phase = CrossSigningBootstrapPhase::Complete;
+                Ok(None)
+            }
+            Err(error) => {
+                if let Some(challenge) = error.as_uiaa_response() {
+                    let challenge = challenge.clone();
+                    state.challenge = challenge.clone();
+                    *mutation_admitted = false;
+                    Ok(Some(challenge))
+                } else {
+                    Err(error.into())
+                }
+            }
+        }
+    }
+
     /// Continue the cross-signing reset by either waiting for the
     /// authentication to be done on the side of the OAuth 2.0 server or by
     /// providing additional [`AuthData`] the homeserver requires.
     pub async fn auth(&self, auth: Option<AuthData>) -> Result<()> {
+        if !matches!(self.auth_type, CrossSigningResetAuthType::OAuth(_)) {
+            return match auth {
+                Some(AuthData::Password(password)) => {
+                    match self.auth_with_password(&password.password).await? {
+                        None => Ok(()),
+                        Some(challenge) => Err(HttpError::Api(Box::new(
+                            FromHttpResponseError::Server(UiaaResponse::AuthResponse(challenge)),
+                        ))
+                        .into()),
+                    }
+                }
+                _ => Err(Error::AuthenticationRequired),
+            };
+        }
+        let _operation_guard = self.oauth_operation_lock.lock().await;
+
+        match self.oauth_state.lock().await.as_ref() {
+            Some(CrossSigningResetOAuthState::Active { .. }) => {}
+            Some(CrossSigningResetOAuthState::Cancelled) | None => {
+                return Err(Error::AuthenticationRequired);
+            }
+            Some(CrossSigningResetOAuthState::Complete) => return Ok(()),
+        }
+
         // Poll to see whether the reset has been authorized twice per second.
         const RETRY_EVERY: Duration = Duration::from_millis(500);
 
@@ -469,22 +583,39 @@ impl CrossSigningResetHandle {
                     "Repeatedly PUTting to keys/device_signing/upload until it works \
                     or we hit a permanent failure."
                 );
-                while let Err(e) = self.client.send(upload_request.clone()).await {
-                    if *self.is_cancelled.lock().await {
-                        return Ok(());
+                loop {
+                    {
+                        let mut oauth_state = self.oauth_state.lock().await;
+                        match oauth_state.as_mut() {
+                            Some(CrossSigningResetOAuthState::Active { mutation_admitted }) => {
+                                *mutation_admitted = true;
+                            }
+                            Some(CrossSigningResetOAuthState::Cancelled) => {
+                                return Err(Error::AuthenticationRequired);
+                            }
+                            Some(CrossSigningResetOAuthState::Complete) => return Ok(()),
+                            None => return Err(Error::AuthenticationRequired),
+                        }
                     }
 
-                    match e.as_uiaa_response() {
-                        Some(uiaa_info) => {
-                            // Return the error except if we are at the `m.oauth` stage where we
-                            // want to keep polling.
-                            if !matches!(self.auth_type, CrossSigningResetAuthType::OAuth(_))
-                                && uiaa_info.auth_error.is_some()
-                            {
+                    match self.client.send(upload_request.clone()).await {
+                        Ok(_) => break,
+                        Err(e) => {
+                            if e.as_uiaa_response().is_some() {
+                                let mut oauth_state = self.oauth_state.lock().await;
+                                match oauth_state.as_mut() {
+                                    Some(CrossSigningResetOAuthState::Active {
+                                        mutation_admitted,
+                                    }) => *mutation_admitted = false,
+                                    Some(CrossSigningResetOAuthState::Cancelled) | None => {
+                                        return Err(Error::AuthenticationRequired);
+                                    }
+                                    Some(CrossSigningResetOAuthState::Complete) => return Ok(()),
+                                }
+                            } else {
                                 return Err(e.into());
                             }
                         }
-                        None => return Err(e.into()),
                     }
 
                     debug!(
@@ -495,6 +626,7 @@ impl CrossSigningResetHandle {
                 }
 
                 self.client.send(self.signatures_request.clone()).await?;
+                *self.oauth_state.lock().await = Some(CrossSigningResetOAuthState::Complete);
 
                 Ok(())
             },
@@ -507,9 +639,44 @@ impl CrossSigningResetHandle {
         })
     }
 
-    /// Cancel the ongoing identity reset process
-    pub async fn cancel(&self) {
-        *self.is_cancelled.lock().await = true;
+    /// Cancel the ongoing identity reset process.
+    ///
+    /// Returns `true` only when cancellation was established before a password
+    /// mutation was admitted. A `false` result means the operation completed or
+    /// may already have committed and must not be presented as cancelled.
+    pub async fn cancel(&self) -> bool {
+        let mut password_state = self.password_state.lock().await;
+        if let Some(state) = password_state.as_mut() {
+            return match state {
+                CrossSigningResetPasswordState::Active { state, mutation_admitted }
+                    if state.phase == CrossSigningBootstrapPhase::Complete
+                        || *mutation_admitted =>
+                {
+                    false
+                }
+                CrossSigningResetPasswordState::Active { .. } => {
+                    *password_state = Some(CrossSigningResetPasswordState::Cancelled);
+                    true
+                }
+                CrossSigningResetPasswordState::Cancelled => true,
+            };
+        }
+
+        let mut oauth_state = self.oauth_state.lock().await;
+        match oauth_state.as_mut() {
+            Some(CrossSigningResetOAuthState::Active { mutation_admitted })
+                if *mutation_admitted =>
+            {
+                false
+            }
+            Some(CrossSigningResetOAuthState::Active { .. }) => {
+                *oauth_state = Some(CrossSigningResetOAuthState::Cancelled);
+                true
+            }
+            Some(CrossSigningResetOAuthState::Cancelled) => true,
+            Some(CrossSigningResetOAuthState::Complete) => false,
+            None => false,
+        }
     }
 }
 
@@ -2507,6 +2674,7 @@ mod tests {
         event_factory::EventFactory,
     };
     use ruma::{
+        api::client::uiaa::{AuthData, Password as UiaaPassword},
         event_id,
         events::{reaction::ReactionEventContent, relation::Annotation},
         user_id,
@@ -2712,6 +2880,387 @@ mod tests {
         assert_eq!(challenge.session.as_deref(), Some("updated-session"));
         assert_eq!(challenge.auth_error.as_ref().unwrap().message, "Invalid password");
         assert!(handle.auth_with_password("correct-password").await.unwrap().is_none());
+    }
+
+    #[async_test]
+    async fn test_identity_reset_password_continuation_binds_user_and_uiaa_session() {
+        let (client, server) = logged_in_client_with_server().await;
+        mount_device_key_upload(&server).await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"^/_matrix/client/(?:r0|v3|unstable)/keys/device_signing/upload$"))
+            .respond_with(|request: &Request| {
+                let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+                match body.get("auth") {
+                    None | Some(serde_json::Value::Null) => ResponseTemplate::new(401)
+                        .set_body_json(json!({
+                            "flows": [{ "stages": ["m.login.password"] }],
+                            "params": {},
+                            "session": "identity-reset-session",
+                        })),
+                    Some(auth) => {
+                        assert_eq!(auth["identifier"]["user"], "@example:localhost");
+                        assert_eq!(auth["password"], "correct-password");
+                        assert_eq!(auth["session"], "identity-reset-session");
+                        ResponseTemplate::new(200).set_body_json(json!({}))
+                    }
+                }
+            })
+            .expect(2)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"^/_matrix/client/(?:r0|v3|unstable)/keys/signatures/upload$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let handle = client.encryption().reset_cross_signing().await.unwrap().unwrap();
+        let challenge = handle.auth_with_password("correct-password").await.unwrap();
+
+        assert!(challenge.is_none());
+    }
+
+    #[async_test]
+    async fn test_identity_reset_generic_password_auth_preserves_compatibility_and_authority() {
+        let (client, server) = logged_in_client_with_server().await;
+        mount_device_key_upload(&server).await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"^/_matrix/client/(?:r0|v3|unstable)/keys/device_signing/upload$"))
+            .respond_with(|request: &Request| {
+                let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+                match body.get("auth") {
+                    None | Some(serde_json::Value::Null) => ResponseTemplate::new(401)
+                        .set_body_json(json!({
+                            "flows": [{ "stages": ["m.login.password"] }],
+                            "params": {},
+                            "session": "authoritative-reset-session",
+                        })),
+                    Some(auth) if auth["password"] == "wrong-password" => {
+                        assert_eq!(auth["identifier"]["user"], "@example:localhost");
+                        assert_eq!(auth["session"], "authoritative-reset-session");
+                        ResponseTemplate::new(401).set_body_json(json!({
+                            "errcode": "M_FORBIDDEN",
+                            "error": "Invalid password",
+                            "flows": [{ "stages": ["m.login.password"] }],
+                            "params": {},
+                            "session": "updated-authoritative-session",
+                        }))
+                    }
+                    Some(auth) => {
+                        assert_eq!(auth["identifier"]["user"], "@example:localhost");
+                        assert_eq!(auth["password"], "correct-password");
+                        assert_eq!(auth["session"], "updated-authoritative-session");
+                        ResponseTemplate::new(200).set_body_json(json!({}))
+                    }
+                }
+            })
+            .expect(3)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"^/_matrix/client/(?:r0|v3|unstable)/keys/signatures/upload$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let handle = client.encryption().reset_cross_signing().await.unwrap().unwrap();
+        let attacker = ruma::UserId::parse("@attacker:evil.example").unwrap();
+        let mut auth = UiaaPassword::new(attacker.into(), "wrong-password".to_owned());
+        auth.session = Some("caller-controlled-session".to_owned());
+        let error = handle.auth(Some(AuthData::Password(auth))).await.unwrap_err();
+        let challenge = error.as_uiaa_response().expect("updated UIAA must remain observable");
+        assert_eq!(challenge.session.as_deref(), Some("updated-authoritative-session"));
+        assert_eq!(challenge.auth_error.as_ref().unwrap().message, "Invalid password");
+
+        let attacker = ruma::UserId::parse("@attacker:evil.example").unwrap();
+        let mut auth = UiaaPassword::new(attacker.into(), "correct-password".to_owned());
+        auth.session = Some("second-caller-controlled-session".to_owned());
+        handle.auth(Some(AuthData::Password(auth))).await.unwrap();
+    }
+
+    #[async_test]
+    async fn test_identity_reset_password_continuation_updates_session_after_rejection() {
+        let (client, server) = logged_in_client_with_server().await;
+        mount_device_key_upload(&server).await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"^/_matrix/client/(?:r0|v3|unstable)/keys/device_signing/upload$"))
+            .respond_with(|request: &Request| {
+                let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+                match body.pointer("/auth/password").and_then(|v| v.as_str()) {
+                    None => ResponseTemplate::new(401).set_body_json(json!({
+                        "flows": [{ "stages": ["m.login.password"] }],
+                        "params": {},
+                        "session": "first-reset-session",
+                    })),
+                    Some("wrong-password") => {
+                        assert_eq!(body["auth"]["session"], "first-reset-session");
+                        ResponseTemplate::new(401).set_body_json(json!({
+                            "errcode": "M_FORBIDDEN",
+                            "error": "Invalid password",
+                            "flows": [{ "stages": ["m.login.password"] }],
+                            "params": {},
+                            "session": "updated-reset-session",
+                        }))
+                    }
+                    Some("correct-password") => {
+                        assert_eq!(body["auth"]["session"], "updated-reset-session");
+                        ResponseTemplate::new(200).set_body_json(json!({}))
+                    }
+                    Some(password) => panic!("unexpected password: {password}"),
+                }
+            })
+            .expect(3)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"^/_matrix/client/(?:r0|v3|unstable)/keys/signatures/upload$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let handle = client.encryption().reset_cross_signing().await.unwrap().unwrap();
+        let challenge = handle
+            .auth_with_password("wrong-password")
+            .await
+            .unwrap()
+            .expect("wrong password should return the updated UIAA challenge");
+        assert_eq!(challenge.session.as_deref(), Some("updated-reset-session"));
+        assert_eq!(challenge.auth_error.as_ref().unwrap().message, "Invalid password");
+        assert!(handle.auth_with_password("correct-password").await.unwrap().is_none());
+    }
+
+    #[async_test]
+    async fn test_identity_reset_password_continuation_fails_closed_after_cancel() {
+        let (client, server) = logged_in_client_with_server().await;
+        mount_device_key_upload(&server).await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"^/_matrix/client/(?:r0|v3|unstable)/keys/device_signing/upload$"))
+            .respond_with(ResponseTemplate::new(401).set_body_json(json!({
+                "flows": [{ "stages": ["m.login.password"] }],
+                "params": {},
+                "session": "cancelled-reset-session",
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let handle = client.encryption().reset_cross_signing().await.unwrap().unwrap();
+        assert!(handle.cancel().await, "cancellation before password continuation must succeed");
+
+        assert!(handle.auth_with_password("must-not-be-sent").await.is_err());
+    }
+
+    #[async_test]
+    async fn test_identity_reset_cancel_reports_too_late_after_password_mutation_is_admitted() {
+        let (client, server) = logged_in_client_with_server().await;
+        mount_device_key_upload(&server).await;
+        let authenticated_request_started = Arc::new(AtomicBool::new(false));
+        let request_started = authenticated_request_started.clone();
+        Mock::given(method("POST"))
+            .and(path_regex(r"^/_matrix/client/(?:r0|v3|unstable)/keys/device_signing/upload$"))
+            .respond_with(move |request: &Request| {
+                let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+                if body.get("auth").is_none() {
+                    ResponseTemplate::new(401).set_body_json(json!({
+                        "flows": [{ "stages": ["m.login.password"] }],
+                        "params": {},
+                        "session": "cancel-race-session",
+                    }))
+                } else {
+                    request_started.store(true, Ordering::SeqCst);
+                    ResponseTemplate::new(200)
+                        .set_delay(Duration::from_millis(100))
+                        .set_body_json(json!({}))
+                }
+            })
+            .expect(2)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"^/_matrix/client/(?:r0|v3|unstable)/keys/signatures/upload$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let handle = Arc::new(client.encryption().reset_cross_signing().await.unwrap().unwrap());
+        let continuation_handle = handle.clone();
+        let continuation = matrix_sdk_common::executor::spawn(async move {
+            continuation_handle.auth_with_password("correct-password").await
+        });
+        while !authenticated_request_started.load(Ordering::SeqCst) {
+            tokio::task::yield_now().await;
+        }
+
+        assert!(
+            !handle.cancel().await,
+            "cancellation must report too late once a mutation is admitted"
+        );
+        assert!(continuation.await.unwrap().unwrap().is_none());
+    }
+
+    #[async_test]
+    async fn test_identity_reset_cancel_reports_too_late_after_oauth_mutation_is_admitted() {
+        let (client, server) = logged_in_client_with_server().await;
+        mount_device_key_upload(&server).await;
+        let request_count = Arc::new(AtomicUsize::new(0));
+        let authenticated_request_started = Arc::new(AtomicBool::new(false));
+        let count = request_count.clone();
+        let request_started = authenticated_request_started.clone();
+        Mock::given(method("POST"))
+            .and(path_regex(r"^/_matrix/client/(?:r0|v3|unstable)/keys/device_signing/upload$"))
+            .respond_with(move |_request: &Request| {
+                if count.fetch_add(1, Ordering::SeqCst) == 0 {
+                    ResponseTemplate::new(401).set_body_json(json!({
+                        "flows": [{ "stages": ["m.oauth"] }],
+                        "params": { "m.oauth": { "url": "https://auth.example.org/approve" } },
+                        "session": "oauth-cancel-race-session",
+                    }))
+                } else {
+                    request_started.store(true, Ordering::SeqCst);
+                    ResponseTemplate::new(200)
+                        .set_delay(Duration::from_millis(100))
+                        .set_body_json(json!({}))
+                }
+            })
+            .expect(2)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"^/_matrix/client/(?:r0|v3|unstable)/keys/signatures/upload$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let handle = Arc::new(client.encryption().reset_cross_signing().await.unwrap().unwrap());
+        assert!(matches!(handle.auth_type(), super::CrossSigningResetAuthType::OAuth(_)));
+        let continuation_handle = handle.clone();
+        let continuation =
+            matrix_sdk_common::executor::spawn(async move { continuation_handle.auth(None).await });
+        while !authenticated_request_started.load(Ordering::SeqCst) {
+            tokio::task::yield_now().await;
+        }
+
+        assert!(
+            !handle.cancel().await,
+            "OAuth cancellation must report too late once a mutation is admitted"
+        );
+        continuation.await.unwrap().unwrap();
+    }
+
+    #[async_test]
+    async fn test_identity_reset_oauth_cancel_before_polling_fails_closed() {
+        let (client, server) = logged_in_client_with_server().await;
+        mount_device_key_upload(&server).await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"^/_matrix/client/(?:r0|v3|unstable)/keys/device_signing/upload$"))
+            .respond_with(ResponseTemplate::new(401).set_body_json(json!({
+                "flows": [{ "stages": ["m.oauth"] }],
+                "params": { "m.oauth": { "url": "https://auth.example.org/approve" } },
+                "session": "oauth-cancel-before-polling-session",
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"^/_matrix/client/(?:r0|v3|unstable)/keys/signatures/upload$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        let handle = client.encryption().reset_cross_signing().await.unwrap().unwrap();
+        assert!(handle.cancel().await);
+        assert!(handle.auth(None).await.is_err(), "cancelled OAuth must not report completion");
+    }
+
+    #[async_test]
+    async fn test_identity_reset_oauth_cancel_between_retries_stops_active_continuation() {
+        let (client, server) = logged_in_client_with_server().await;
+        mount_device_key_upload(&server).await;
+        let request_count = Arc::new(AtomicUsize::new(0));
+        let count = request_count.clone();
+        Mock::given(method("POST"))
+            .and(path_regex(r"^/_matrix/client/(?:r0|v3|unstable)/keys/device_signing/upload$"))
+            .respond_with(move |_request: &Request| {
+                count.fetch_add(1, Ordering::SeqCst);
+                ResponseTemplate::new(401).set_body_json(json!({
+                    "flows": [{ "stages": ["m.oauth"] }],
+                    "params": { "m.oauth": { "url": "https://auth.example.org/approve" } },
+                    "session": "oauth-cancel-between-retries-session",
+                }))
+            })
+            .expect(2)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"^/_matrix/client/(?:r0|v3|unstable)/keys/signatures/upload$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        let handle = Arc::new(client.encryption().reset_cross_signing().await.unwrap().unwrap());
+        let continuation_handle = handle.clone();
+        let continuation =
+            matrix_sdk_common::executor::spawn(async move { continuation_handle.auth(None).await });
+        while request_count.load(Ordering::SeqCst) < 2 {
+            tokio::task::yield_now().await;
+        }
+        while !handle.cancel().await {
+            tokio::task::yield_now().await;
+        }
+
+        assert!(continuation.await.unwrap().is_err());
+    }
+
+    #[async_test]
+    async fn test_identity_reset_oauth_continuations_are_single_flight_and_terminal() {
+        let (client, server) = logged_in_client_with_server().await;
+        mount_device_key_upload(&server).await;
+        let request_count = Arc::new(AtomicUsize::new(0));
+        let count = request_count.clone();
+        Mock::given(method("POST"))
+            .and(path_regex(r"^/_matrix/client/(?:r0|v3|unstable)/keys/device_signing/upload$"))
+            .respond_with(move |_request: &Request| {
+                if count.fetch_add(1, Ordering::SeqCst) == 0 {
+                    ResponseTemplate::new(401).set_body_json(json!({
+                        "flows": [{ "stages": ["m.oauth"] }],
+                        "params": { "m.oauth": { "url": "https://auth.example.org/approve" } },
+                        "session": "oauth-single-flight-session",
+                    }))
+                } else {
+                    ResponseTemplate::new(200)
+                        .set_delay(Duration::from_millis(100))
+                        .set_body_json(json!({}))
+                }
+            })
+            .expect(2)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"^/_matrix/client/(?:r0|v3|unstable)/keys/signatures/upload$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let handle = Arc::new(client.encryption().reset_cross_signing().await.unwrap().unwrap());
+        let first_handle = handle.clone();
+        let second_handle = handle.clone();
+        let first =
+            matrix_sdk_common::executor::spawn(async move { first_handle.auth(None).await });
+        let second =
+            matrix_sdk_common::executor::spawn(async move { second_handle.auth(None).await });
+
+        first.await.unwrap().unwrap();
+        second.await.unwrap().unwrap();
+        handle.auth(None).await.unwrap();
+        assert_eq!(request_count.load(Ordering::SeqCst), 2);
     }
 
     #[async_test]
