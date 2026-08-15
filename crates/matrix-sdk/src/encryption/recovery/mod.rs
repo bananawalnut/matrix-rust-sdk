@@ -93,7 +93,7 @@
 use futures_core::{Future, Stream};
 use futures_util::StreamExt as _;
 use ruma::{
-    api::client::keys::get_keys,
+    api::client::{keys::get_keys, uiaa::UiaaInfo},
     events::{
         GlobalAccountDataEventType,
         secret::{request::SecretName, send::ToDeviceSecretSendEvent},
@@ -102,6 +102,7 @@ use ruma::{
     serde::Raw,
 };
 use serde_json::{json, value::to_raw_value};
+use tokio::sync::Mutex;
 use tracing::{error, info, instrument, warn};
 
 #[cfg(doc)]
@@ -449,6 +450,7 @@ impl Recovery {
             Ok(Some(IdentityResetHandle {
                 client: self.client.clone(),
                 cross_signing_reset_handle: handle,
+                operation_lock: Mutex::new(false),
             }))
         } else {
             // No authentication required, re-enable backups
@@ -777,6 +779,7 @@ impl Recovery {
 pub struct IdentityResetHandle {
     client: Client,
     cross_signing_reset_handle: CrossSigningResetHandle,
+    operation_lock: Mutex<bool>,
 }
 
 impl IdentityResetHandle {
@@ -786,21 +789,49 @@ impl IdentityResetHandle {
         &self.cross_signing_reset_handle.auth_type
     }
 
+    /// Continue a UIAA-backed identity reset using the logged-in user's
+    /// password and the retained UIAA session.
+    ///
+    /// Returns an updated challenge when authentication is rejected and
+    /// `None` once the reset and any required backup re-enablement complete.
+    pub async fn reset_with_password(&self, password: &str) -> Result<Option<UiaaInfo>> {
+        let mut operation_complete = self.operation_lock.lock().await;
+        if *operation_complete {
+            return Ok(None);
+        }
+        let challenge = self.cross_signing_reset_handle.auth_with_password(password).await?;
+        if challenge.is_none()
+            && self.client.encryption().recovery().should_auto_enable_backups().await?
+        {
+            self.client.encryption().recovery().enable_backup().await?;
+        }
+        if challenge.is_none() {
+            *operation_complete = true;
+        }
+
+        Ok(challenge)
+    }
+
     /// This method will retry to upload the device keys after the previous try
     /// failed due to required authentication
     pub async fn reset(&self, auth: Option<AuthData>) -> Result<()> {
+        let mut operation_complete = self.operation_lock.lock().await;
+        if *operation_complete {
+            return Ok(());
+        }
         self.cross_signing_reset_handle.auth(auth).await?;
 
         if self.client.encryption().recovery().should_auto_enable_backups().await? {
             self.client.encryption().recovery().enable_backup().await?;
         }
+        *operation_complete = true;
 
         Ok(())
     }
 
     /// Cancel the ongoing identity reset process
-    pub async fn cancel(&self) {
-        self.cross_signing_reset_handle.cancel().await;
+    pub async fn cancel(&self) -> bool {
+        self.cross_signing_reset_handle.cancel().await
     }
 }
 
@@ -820,6 +851,20 @@ pub(crate) mod tests {
         encryption::{recovery::types::RecoveryError, secret_storage::SecretStorageError},
         test_utils::mocks::MatrixMockServer,
     };
+
+    #[test]
+    fn identity_reset_continuation_and_backup_finalization_share_one_operation_lock() {
+        let source = include_str!("mod.rs");
+        let start = source.find("pub struct IdentityResetHandle").unwrap();
+        let end = source[start..]
+            .find("// The http mocking library is not supported")
+            .map(|offset| start + offset)
+            .unwrap();
+        let handle = &source[start..end];
+
+        assert!(handle.contains("operation_lock: Mutex<bool>"));
+        assert_eq!(handle.matches("self.operation_lock.lock().await").count(), 2);
+    }
 
     // If recovery fails due when importing a secret from secret storage, we
     // should get the `ImportError` variant of `SecretStorageError`.  The
