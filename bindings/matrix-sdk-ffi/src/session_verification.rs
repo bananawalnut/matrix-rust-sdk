@@ -12,10 +12,7 @@
 // See the License for that specific language governing permissions and
 // limitations under the License.
 
-use std::sync::{
-    Arc, Mutex, RwLock, Weak,
-    atomic::{AtomicBool, Ordering},
-};
+use std::sync::{Arc, Mutex, RwLock, Weak};
 
 use futures_util::StreamExt;
 use matrix_sdk::{
@@ -92,6 +89,53 @@ pub trait SessionVerificationControllerDelegate: SyncOutsideWasm + SendOutsideWa
 }
 
 pub type Delegate = Arc<RwLock<Option<Arc<dyn SessionVerificationControllerDelegate>>>>;
+type ListenerGeneration = u64;
+
+#[derive(Default)]
+struct CallbackAuthority {
+    state: Mutex<CallbackAuthorityState>,
+}
+
+#[derive(Default)]
+struct CallbackAuthorityState {
+    active_generation: ListenerGeneration,
+    terminal: bool,
+}
+
+impl CallbackAuthority {
+    fn activate(&self) -> ListenerGeneration {
+        let mut state = self.state.lock().unwrap();
+        state.active_generation = state.active_generation.wrapping_add(1).max(1);
+        state.terminal = false;
+        state.active_generation
+    }
+
+    fn current(&self) -> ListenerGeneration {
+        self.state.lock().unwrap().active_generation
+    }
+
+    fn invoke<F>(
+        &self,
+        generation: ListenerGeneration,
+        delegate: &Delegate,
+        terminal: bool,
+        callback: F,
+    ) -> bool
+    where
+        F: FnOnce(&dyn SessionVerificationControllerDelegate),
+    {
+        let mut state = self.state.lock().unwrap();
+        if state.active_generation != generation || state.terminal {
+            return false;
+        }
+        state.terminal = terminal;
+        let current_delegate = delegate.read().unwrap().clone();
+        if let Some(current_delegate) = current_delegate {
+            callback(current_delegate.as_ref());
+        }
+        true
+    }
+}
 
 #[derive(Default)]
 struct ListenerTasks {
@@ -149,7 +193,7 @@ pub struct SessionVerificationController {
     sas_verification: Arc<RwLock<Option<SasVerification>>>,
     qr_verification: Arc<RwLock<Option<QrVerification>>>,
     listener_tasks: Arc<ListenerTasks>,
-    locally_starting_sas: Arc<AtomicBool>,
+    callback_authority: Arc<CallbackAuthority>,
 }
 
 #[matrix_sdk_ffi_macros::export]
@@ -231,14 +275,34 @@ impl SessionVerificationController {
             return Err(ClientError::from_str("Verification request missing.", None));
         };
 
-        self.locally_starting_sas.store(true, Ordering::Release);
+        let request_generation = self.callback_authority.current();
         match verification_request.start_sas().await {
-            Ok(Some(_)) => {}
+            Ok(Some(verification)) => {
+                *self.sas_verification.write().unwrap() = Some(verification.clone());
+                let generation = self.callback_authority.activate();
+                let task = get_runtime_handle().spawn(Self::listen_to_sas_verification_changes(
+                    verification,
+                    self.delegate.clone(),
+                    Arc::downgrade(&self.callback_authority),
+                    generation,
+                ));
+                self.listener_tasks.replace_concrete_listener(task.abort_handle(), true);
+                Self::notify_active(
+                    &Arc::downgrade(&self.callback_authority),
+                    generation,
+                    &self.delegate,
+                    false,
+                    |delegate| delegate.did_start_sas_verification(),
+                );
+            }
             _ => {
-                self.locally_starting_sas.store(false, Ordering::Release);
-                if let Some(delegate) = Self::current_delegate(&self.delegate) {
-                    delegate.did_fail()
-                }
+                Self::notify_active(
+                    &Arc::downgrade(&self.callback_authority),
+                    request_generation,
+                    &self.delegate,
+                    true,
+                    |delegate| delegate.did_fail(),
+                );
             }
         }
 
@@ -258,8 +322,13 @@ impl SessionVerificationController {
             .await?
             .ok_or(ClientError::from_str("QR verification is unavailable.", None))?;
         *self.qr_verification.write().unwrap() = Some(qr.clone());
-        let task = get_runtime_handle()
-            .spawn(Self::listen_to_qr_verification_changes(qr.clone(), self.delegate.clone()));
+        let generation = self.callback_authority.activate();
+        let task = get_runtime_handle().spawn(Self::listen_to_qr_verification_changes(
+            qr.clone(),
+            self.delegate.clone(),
+            Arc::downgrade(&self.callback_authority),
+            generation,
+        ));
         self.listener_tasks.replace_concrete_listener(task.abort_handle(), true);
         let bytes = qr.to_bytes().map_err(|error| {
             ClientError::from_str(format!("Failed encoding QR verification: {error}"), None)
@@ -277,15 +346,19 @@ impl SessionVerificationController {
             ClientError::from_str(format!("Invalid QR verification data: {error}"), None)
         })?;
         *self.qr_verification.write().unwrap() = None;
-        self.listener_tasks.abort_concrete_listener();
         self.install_request_listener(verification_request.clone());
         let qr = verification_request
             .scan_qr_code(data)
             .await?
             .ok_or(ClientError::from_str("QR verification is unavailable.", None))?;
         *self.qr_verification.write().unwrap() = Some(qr.clone());
-        let task = get_runtime_handle()
-            .spawn(Self::listen_to_qr_verification_changes(qr, self.delegate.clone()));
+        let generation = self.callback_authority.activate();
+        let task = get_runtime_handle().spawn(Self::listen_to_qr_verification_changes(
+            qr,
+            self.delegate.clone(),
+            Arc::downgrade(&self.callback_authority),
+            generation,
+        ));
         self.listener_tasks.replace_concrete_listener(task.abort_handle(), true);
         Ok(())
     }
@@ -361,7 +434,7 @@ impl SessionVerificationController {
             sas_verification: Arc::new(RwLock::new(None)),
             qr_verification: Arc::new(RwLock::new(None)),
             listener_tasks: Arc::new(ListenerTasks::default()),
-            locally_starting_sas: Arc::new(AtomicBool::new(false)),
+            callback_authority: Arc::new(CallbackAuthority::default()),
         }
     }
 
@@ -425,8 +498,6 @@ impl SessionVerificationController {
         *self.verification_request.write().unwrap() = Some(verification_request.clone());
         *self.sas_verification.write().unwrap() = None;
         *self.qr_verification.write().unwrap() = None;
-        self.locally_starting_sas.store(false, Ordering::Release);
-        self.listener_tasks.abort_all();
 
         self.install_request_listener(verification_request);
 
@@ -434,12 +505,15 @@ impl SessionVerificationController {
     }
 
     fn install_request_listener(&self, verification_request: VerificationRequest) {
+        let generation = self.callback_authority.activate();
+        self.listener_tasks.abort_all();
         let task = get_runtime_handle().spawn(Self::listen_to_verification_request_changes(
             verification_request,
             self.sas_verification.clone(),
             self.delegate.clone(),
             Arc::downgrade(&self.listener_tasks),
-            self.locally_starting_sas.clone(),
+            Arc::downgrade(&self.callback_authority),
+            generation,
         ));
         self.listener_tasks.replace_request_listener(task.abort_handle());
     }
@@ -454,12 +528,28 @@ impl SessionVerificationController {
         delegate.read().unwrap().clone()
     }
 
+    fn notify_active<F>(
+        callback_authority: &Weak<CallbackAuthority>,
+        generation: ListenerGeneration,
+        delegate: &Delegate,
+        terminal: bool,
+        callback: F,
+    ) -> bool
+    where
+        F: FnOnce(&dyn SessionVerificationControllerDelegate),
+    {
+        callback_authority
+            .upgrade()
+            .is_some_and(|authority| authority.invoke(generation, delegate, terminal, callback))
+    }
+
     async fn listen_to_verification_request_changes(
         verification_request: VerificationRequest,
         sas_verification: Arc<RwLock<Option<SasVerification>>>,
         delegate: Delegate,
         listener_tasks: Weak<ListenerTasks>,
-        locally_starting_sas: Arc<AtomicBool>,
+        callback_authority: Weak<CallbackAuthority>,
+        request_generation: ListenerGeneration,
     ) {
         let mut stream = verification_request.changes();
 
@@ -474,46 +564,76 @@ impl SessionVerificationController {
                     }
 
                     let Some(verification) = verification.sas() else { continue };
+                    if verification.we_started() {
+                        // The initiating method owns local SAS installation and
+                        // reconciles its network result before emitting callbacks.
+                        continue;
+                    }
                     *sas_verification.write().unwrap() = Some(verification.clone());
 
                     let Some(listener_tasks) = listener_tasks.upgrade() else { break };
+                    let Some(authority) = callback_authority.upgrade() else { break };
+                    let generation = authority.activate();
+                    drop(authority);
                     let task =
                         get_runtime_handle().spawn(Self::listen_to_sas_verification_changes(
                             verification.clone(),
                             delegate.clone(),
+                            callback_authority.clone(),
+                            generation,
                         ));
                     listener_tasks.replace_concrete_listener(task.abort_handle(), false);
+                    drop(listener_tasks);
 
-                    let locally_started = locally_starting_sas.swap(false, Ordering::AcqRel);
-                    if !locally_started && verification.accept().await.is_err() {
-                        if let Some(current_delegate) = Self::current_delegate(&delegate) {
-                            current_delegate.did_fail()
-                        }
+                    if verification.accept().await.is_err() {
+                        Self::notify_active(
+                            &callback_authority,
+                            generation,
+                            &delegate,
+                            true,
+                            |delegate| delegate.did_fail(),
+                        );
                         break;
                     }
-                    if let Some(current_delegate) = Self::current_delegate(&delegate) {
-                        current_delegate.did_start_sas_verification()
-                    }
+                    Self::notify_active(
+                        &callback_authority,
+                        generation,
+                        &delegate,
+                        false,
+                        |delegate| delegate.did_start_sas_verification(),
+                    );
 
                     // The concrete SAS listener was installed before the only
                     // fallible handoff, so it now owns terminal events.
                     break;
                 }
                 VerificationRequestState::Ready { .. } => {
-                    if let Some(current_delegate) = Self::current_delegate(&delegate) {
-                        current_delegate.did_accept_verification_request()
-                    }
+                    Self::notify_active(
+                        &callback_authority,
+                        request_generation,
+                        &delegate,
+                        false,
+                        |delegate| delegate.did_accept_verification_request(),
+                    );
                 }
                 VerificationRequestState::Done => {
-                    if let Some(current_delegate) = Self::current_delegate(&delegate) {
-                        current_delegate.did_finish();
-                    }
+                    Self::notify_active(
+                        &callback_authority,
+                        request_generation,
+                        &delegate,
+                        true,
+                        |delegate| delegate.did_finish(),
+                    );
                     break;
                 }
                 VerificationRequestState::Cancelled(..) => {
-                    if let Some(current_delegate) = Self::current_delegate(&delegate) {
-                        current_delegate.did_cancel();
-                    }
+                    Self::notify_active(
+                        &callback_authority,
+                        request_generation,
+                        &delegate,
+                        true,
+                        |delegate| delegate.did_cancel(),
+                    );
                     break;
                 }
                 _ => {}
@@ -521,50 +641,64 @@ impl SessionVerificationController {
         }
     }
 
-    async fn listen_to_sas_verification_changes(sas: SasVerification, delegate: Delegate) {
+    async fn listen_to_sas_verification_changes(
+        sas: SasVerification,
+        delegate: Delegate,
+        callback_authority: Weak<CallbackAuthority>,
+        generation: ListenerGeneration,
+    ) {
         let mut stream = sas.changes();
 
         while let Some(state) = stream.next().await {
             match state {
                 SasState::KeysExchanged { emojis, decimals } => {
-                    if let Some(current_delegate) = Self::current_delegate(&delegate) {
-                        if let Some(emojis) = emojis {
-                            current_delegate.did_receive_verification_data(
-                                SessionVerificationData::Emojis {
-                                    emojis: emojis
-                                        .emojis
-                                        .into_iter()
-                                        .map(|emoji| {
-                                            Arc::new(SessionVerificationEmoji {
-                                                symbol: emoji.symbol.to_owned(),
-                                                description: emoji.description.to_owned(),
-                                            })
-                                        })
-                                        .collect(),
-                                    indices: emojis.indices.to_vec(),
-                                },
-                            );
-                        } else {
-                            current_delegate.did_receive_verification_data(
-                                SessionVerificationData::Decimals {
-                                    values: vec![decimals.0, decimals.1, decimals.2],
-                                },
-                            )
+                    let data = if let Some(emojis) = emojis {
+                        SessionVerificationData::Emojis {
+                            emojis: emojis
+                                .emojis
+                                .into_iter()
+                                .map(|emoji| {
+                                    Arc::new(SessionVerificationEmoji {
+                                        symbol: emoji.symbol.to_owned(),
+                                        description: emoji.description.to_owned(),
+                                    })
+                                })
+                                .collect(),
+                            indices: emojis.indices.to_vec(),
                         }
-                    }
+                    } else {
+                        SessionVerificationData::Decimals {
+                            values: vec![decimals.0, decimals.1, decimals.2],
+                        }
+                    };
+                    Self::notify_active(
+                        &callback_authority,
+                        generation,
+                        &delegate,
+                        false,
+                        move |delegate| delegate.did_receive_verification_data(data),
+                    );
                 }
                 SasState::Done { .. } => {
-                    if let Some(current_delegate) = Self::current_delegate(&delegate) {
-                        current_delegate.did_finish()
-                    }
+                    Self::notify_active(
+                        &callback_authority,
+                        generation,
+                        &delegate,
+                        true,
+                        |delegate| delegate.did_finish(),
+                    );
                     break;
                 }
                 SasState::Cancelled(_cancel_info) => {
                     // TODO: The cancel_info is usable, we should tell the user why we were
                     // cancelled.
-                    if let Some(current_delegate) = Self::current_delegate(&delegate) {
-                        current_delegate.did_cancel()
-                    }
+                    Self::notify_active(
+                        &callback_authority,
+                        generation,
+                        &delegate,
+                        true,
+                        |delegate| delegate.did_cancel(),
+                    );
                     break;
                 }
                 SasState::Created { .. }
@@ -575,7 +709,12 @@ impl SessionVerificationController {
         }
     }
 
-    async fn listen_to_qr_verification_changes(qr: QrVerification, delegate: Delegate) {
+    async fn listen_to_qr_verification_changes(
+        qr: QrVerification,
+        delegate: Delegate,
+        callback_authority: Weak<CallbackAuthority>,
+        generation: ListenerGeneration,
+    ) {
         let mut stream = qr.changes();
         while let Some(state) = stream.next().await {
             let update = match state {
@@ -583,23 +722,35 @@ impl SessionVerificationController {
                 QrVerificationState::Reciprocated => Some(SessionVerificationQrState::Reciprocated),
                 QrVerificationState::Confirmed => Some(SessionVerificationQrState::Confirmed),
                 QrVerificationState::Done { .. } => {
-                    if let Some(current_delegate) = Self::current_delegate(&delegate) {
-                        current_delegate.did_finish();
-                    }
+                    Self::notify_active(
+                        &callback_authority,
+                        generation,
+                        &delegate,
+                        true,
+                        |delegate| delegate.did_finish(),
+                    );
                     break;
                 }
                 QrVerificationState::Cancelled(_) => {
-                    if let Some(current_delegate) = Self::current_delegate(&delegate) {
-                        current_delegate.did_cancel();
-                    }
+                    Self::notify_active(
+                        &callback_authority,
+                        generation,
+                        &delegate,
+                        true,
+                        |delegate| delegate.did_cancel(),
+                    );
                     break;
                 }
                 QrVerificationState::Started => None,
             };
-            if let Some(update) = update
-                && let Some(current_delegate) = Self::current_delegate(&delegate)
-            {
-                current_delegate.did_update_qr_verification(update);
+            if let Some(update) = update {
+                Self::notify_active(
+                    &callback_authority,
+                    generation,
+                    &delegate,
+                    false,
+                    move |delegate| delegate.did_update_qr_verification(update),
+                );
             }
         }
     }
@@ -607,12 +758,19 @@ impl SessionVerificationController {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{Arc, RwLock};
+    use std::{
+        sync::{
+            Arc, Condvar, Mutex, RwLock,
+            atomic::{AtomicUsize, Ordering},
+            mpsc,
+        },
+        time::Duration,
+    };
 
     use matrix_sdk::ruma::events::key::verification::VerificationMethod;
 
     use super::{
-        Delegate, ListenerTasks, SessionVerificationController,
+        CallbackAuthority, Delegate, ListenerTasks, SessionVerificationController,
         SessionVerificationControllerDelegate, SessionVerificationData, SessionVerificationQrState,
         SessionVerificationRequestDetails,
     };
@@ -703,7 +861,7 @@ mod tests {
     }
 
     #[test]
-    fn locally_started_sas_has_only_the_request_listener_as_owner() {
+    fn locally_started_sas_uses_sdk_identity_and_generation_authority() {
         let source = include_str!("session_verification.rs");
         let start_sas = source_section(
             source,
@@ -711,8 +869,10 @@ mod tests {
             "pub async fn generate_qr_verification_code",
         );
 
-        assert!(!start_sas.contains("listen_to_sas_verification_changes"));
-        assert!(!start_sas.contains("did_start_sas_verification"));
+        assert!(start_sas.contains("listen_to_sas_verification_changes"));
+        assert!(start_sas.contains("callback_authority.activate()"));
+        assert!(start_sas.contains("notify_active"));
+        assert!(!start_sas.contains("locally_starting_sas"));
     }
 
     #[test]
@@ -731,7 +891,6 @@ mod tests {
 
         assert!(generate.contains("replace_concrete_listener"));
         assert!(scan.contains("replace_concrete_listener"));
-        assert!(scan.contains("abort_concrete_listener"));
         assert!(scan.contains("install_request_listener"));
         assert!(generate.contains("task.abort_handle()"));
         assert!(scan.contains("task.abort_handle()"));
@@ -801,5 +960,141 @@ mod tests {
         assert!(weak_tasks.upgrade().is_none());
         assert!(request.await.expect_err("request listener must be drained").is_cancelled());
         assert!(concrete.await.expect_err("concrete listener must be drained").is_cancelled());
+    }
+
+    struct CountingDelegate {
+        calls: AtomicUsize,
+    }
+
+    impl SessionVerificationControllerDelegate for CountingDelegate {
+        fn did_cancel(&self) {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+        }
+        fn did_receive_verification_request(&self, _: SessionVerificationRequestDetails) {}
+        fn did_accept_verification_request(&self) {}
+        fn did_start_sas_verification(&self) {}
+        fn did_receive_verification_data(&self, _: SessionVerificationData) {}
+        fn did_update_qr_verification(&self, _: SessionVerificationQrState) {}
+        fn did_fail(&self) {}
+        fn did_finish(&self) {}
+    }
+
+    #[test]
+    fn stale_generation_cannot_emit_callbacks() {
+        let authority = CallbackAuthority::default();
+        let delegate = Arc::new(CountingDelegate { calls: AtomicUsize::new(0) });
+        let slot: Delegate = Arc::new(RwLock::new(Some(delegate.clone())));
+        let stale = authority.activate();
+        let active = authority.activate();
+
+        assert!(!authority.invoke(stale, &slot, false, |delegate| delegate.did_cancel()));
+        assert!(authority.invoke(active, &slot, false, |delegate| delegate.did_cancel()));
+        assert_eq!(delegate.calls.load(Ordering::SeqCst), 1);
+    }
+
+    struct BlockingDelegate {
+        calls: AtomicUsize,
+        entered: Arc<(Mutex<bool>, Condvar)>,
+        release: Arc<(Mutex<bool>, Condvar)>,
+    }
+
+    impl SessionVerificationControllerDelegate for BlockingDelegate {
+        fn did_cancel(&self) {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let (entered, entered_cv) = &*self.entered;
+            *entered.lock().unwrap() = true;
+            entered_cv.notify_one();
+            let (release, release_cv) = &*self.release;
+            let mut released = release.lock().unwrap();
+            while !*released {
+                released = release_cv.wait(released).unwrap();
+            }
+        }
+        fn did_receive_verification_request(&self, _: SessionVerificationRequestDetails) {}
+        fn did_accept_verification_request(&self) {}
+        fn did_start_sas_verification(&self) {}
+        fn did_receive_verification_data(&self, _: SessionVerificationData) {}
+        fn did_update_qr_verification(&self, _: SessionVerificationQrState) {}
+        fn did_fail(&self) {}
+        fn did_finish(&self) {}
+    }
+
+    #[test]
+    fn replacement_serializes_with_callback_dispatch() {
+        let authority = Arc::new(CallbackAuthority::default());
+        let entered = Arc::new((Mutex::new(false), Condvar::new()));
+        let release = Arc::new((Mutex::new(false), Condvar::new()));
+        let delegate = Arc::new(BlockingDelegate {
+            calls: AtomicUsize::new(0),
+            entered: entered.clone(),
+            release: release.clone(),
+        });
+        let slot: Delegate = Arc::new(RwLock::new(Some(delegate.clone())));
+        let first = authority.activate();
+
+        let callback_authority = authority.clone();
+        let callback_slot = slot.clone();
+        let callback = std::thread::spawn(move || {
+            callback_authority
+                .invoke(first, &callback_slot, false, |delegate| delegate.did_cancel())
+        });
+        let (entered_lock, entered_cv) = &*entered;
+        let mut did_enter = entered_lock.lock().unwrap();
+        while !*did_enter {
+            did_enter = entered_cv.wait(did_enter).unwrap();
+        }
+        drop(did_enter);
+
+        let (generation_tx, generation_rx) = mpsc::channel();
+        let replacement_authority = authority.clone();
+        let replacement = std::thread::spawn(move || {
+            generation_tx.send(replacement_authority.activate()).unwrap();
+        });
+        assert!(generation_rx.recv_timeout(Duration::from_millis(50)).is_err());
+
+        let (release_lock, release_cv) = &*release;
+        *release_lock.lock().unwrap() = true;
+        release_cv.notify_one();
+        assert!(callback.join().unwrap());
+        let second = generation_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        replacement.join().unwrap();
+
+        assert!(!authority.invoke(first, &slot, false, |delegate| delegate.did_cancel()));
+        assert!(authority.invoke(second, &slot, false, |delegate| delegate.did_cancel()));
+        assert_eq!(delegate.calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn first_terminal_callback_closes_generation() {
+        let authority = CallbackAuthority::default();
+        let delegate = Arc::new(CountingDelegate { calls: AtomicUsize::new(0) });
+        let slot: Delegate = Arc::new(RwLock::new(Some(delegate.clone())));
+        let generation = authority.activate();
+
+        assert!(authority.invoke(generation, &slot, true, |delegate| delegate.did_cancel()));
+        assert!(!authority.invoke(generation, &slot, true, |delegate| delegate.did_cancel()));
+        assert!(!authority.invoke(generation, &slot, false, |delegate| delegate.did_cancel()));
+        assert_eq!(delegate.calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn upgraded_task_owner_is_released_before_pending_handoff() {
+        let tasks = Arc::new(ListenerTasks::default());
+        let weak_tasks = Arc::downgrade(&tasks);
+        let (installed_tx, installed_rx) = tokio::sync::oneshot::channel();
+        let request = tokio::spawn(async move {
+            let owner = weak_tasks.upgrade().expect("external owner must exist");
+            let concrete = tokio::spawn(std::future::pending::<()>());
+            owner.replace_concrete_listener(concrete.abort_handle(), false);
+            drop(owner);
+            installed_tx.send(()).unwrap();
+            std::future::pending::<()>().await;
+        });
+        tasks.replace_request_listener(request.abort_handle());
+        installed_rx.await.unwrap();
+
+        drop(tasks);
+
+        assert!(request.await.expect_err("request handoff must be cancelled").is_cancelled());
     }
 }
