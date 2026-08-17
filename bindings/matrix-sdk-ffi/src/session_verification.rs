@@ -12,7 +12,10 @@
 // See the License for that specific language governing permissions and
 // limitations under the License.
 
-use std::sync::{Arc, RwLock};
+use std::sync::{
+    Arc, Mutex, RwLock, Weak,
+    atomic::{AtomicBool, Ordering},
+};
 
 use futures_util::StreamExt;
 use matrix_sdk::{
@@ -27,7 +30,7 @@ use matrix_sdk::{
     },
     ruma::events::key::verification::VerificationMethod,
 };
-use matrix_sdk_common::{SendOutsideWasm, SyncOutsideWasm};
+use matrix_sdk_common::{SendOutsideWasm, SyncOutsideWasm, executor::AbortHandle};
 use ruma::UserId;
 use tracing::{error, warn};
 
@@ -90,6 +93,52 @@ pub trait SessionVerificationControllerDelegate: SyncOutsideWasm + SendOutsideWa
 
 pub type Delegate = Arc<RwLock<Option<Arc<dyn SessionVerificationControllerDelegate>>>>;
 
+#[derive(Default)]
+struct ListenerTasks {
+    request: Mutex<Option<AbortHandle>>,
+    concrete: Mutex<Option<AbortHandle>>,
+}
+
+impl ListenerTasks {
+    fn replace_request_listener(&self, handle: AbortHandle) {
+        if let Some(previous) = self.request.lock().unwrap().replace(handle) {
+            previous.abort();
+        }
+    }
+
+    fn replace_concrete_listener(&self, handle: AbortHandle, abort_request: bool) {
+        if let Some(previous) = self.concrete.lock().unwrap().replace(handle) {
+            previous.abort();
+        }
+        if abort_request {
+            self.abort_request_listener();
+        }
+    }
+
+    fn abort_request_listener(&self) {
+        if let Some(handle) = self.request.lock().unwrap().take() {
+            handle.abort();
+        }
+    }
+
+    fn abort_concrete_listener(&self) {
+        if let Some(handle) = self.concrete.lock().unwrap().take() {
+            handle.abort();
+        }
+    }
+
+    fn abort_all(&self) {
+        self.abort_request_listener();
+        self.abort_concrete_listener();
+    }
+}
+
+impl Drop for ListenerTasks {
+    fn drop(&mut self) {
+        self.abort_all();
+    }
+}
+
 #[derive(Clone, uniffi::Object)]
 pub struct SessionVerificationController {
     encryption: Encryption,
@@ -99,6 +148,8 @@ pub struct SessionVerificationController {
     verification_request: Arc<RwLock<Option<VerificationRequest>>>,
     sas_verification: Arc<RwLock<Option<SasVerification>>>,
     qr_verification: Arc<RwLock<Option<QrVerification>>>,
+    listener_tasks: Arc<ListenerTasks>,
+    locally_starting_sas: Arc<AtomicBool>,
 }
 
 #[matrix_sdk_ffi_macros::export]
@@ -180,19 +231,11 @@ impl SessionVerificationController {
             return Err(ClientError::from_str("Verification request missing.", None));
         };
 
+        self.locally_starting_sas.store(true, Ordering::Release);
         match verification_request.start_sas().await {
-            Ok(Some(verification)) => {
-                *self.sas_verification.write().unwrap() = Some(verification.clone());
-
-                if let Some(delegate) = Self::current_delegate(&self.delegate) {
-                    delegate.did_start_sas_verification()
-                }
-
-                let delegate = self.delegate.clone();
-                get_runtime_handle()
-                    .spawn(Self::listen_to_sas_verification_changes(verification, delegate));
-            }
+            Ok(Some(_)) => {}
             _ => {
+                self.locally_starting_sas.store(false, Ordering::Release);
                 if let Some(delegate) = Self::current_delegate(&self.delegate) {
                     delegate.did_fail()
                 }
@@ -214,12 +257,13 @@ impl SessionVerificationController {
             .generate_qr_code()
             .await?
             .ok_or(ClientError::from_str("QR verification is unavailable.", None))?;
+        *self.qr_verification.write().unwrap() = Some(qr.clone());
+        let task = get_runtime_handle()
+            .spawn(Self::listen_to_qr_verification_changes(qr.clone(), self.delegate.clone()));
+        self.listener_tasks.replace_concrete_listener(task.abort_handle(), true);
         let bytes = qr.to_bytes().map_err(|error| {
             ClientError::from_str(format!("Failed encoding QR verification: {error}"), None)
         })?;
-        *self.qr_verification.write().unwrap() = Some(qr.clone());
-        get_runtime_handle()
-            .spawn(Self::listen_to_qr_verification_changes(qr, self.delegate.clone()));
         Ok(bytes)
     }
 
@@ -232,13 +276,17 @@ impl SessionVerificationController {
         let data = QrVerificationData::from_bytes(data).map_err(|error| {
             ClientError::from_str(format!("Invalid QR verification data: {error}"), None)
         })?;
+        *self.qr_verification.write().unwrap() = None;
+        self.listener_tasks.abort_concrete_listener();
+        self.install_request_listener(verification_request.clone());
         let qr = verification_request
             .scan_qr_code(data)
             .await?
             .ok_or(ClientError::from_str("QR verification is unavailable.", None))?;
         *self.qr_verification.write().unwrap() = Some(qr.clone());
-        get_runtime_handle()
+        let task = get_runtime_handle()
             .spawn(Self::listen_to_qr_verification_changes(qr, self.delegate.clone()));
+        self.listener_tasks.replace_concrete_listener(task.abort_handle(), true);
         Ok(())
     }
 
@@ -312,6 +360,8 @@ impl SessionVerificationController {
             verification_request: Arc::new(RwLock::new(None)),
             sas_verification: Arc::new(RwLock::new(None)),
             qr_verification: Arc::new(RwLock::new(None)),
+            listener_tasks: Arc::new(ListenerTasks::default()),
+            locally_starting_sas: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -375,14 +425,23 @@ impl SessionVerificationController {
         *self.verification_request.write().unwrap() = Some(verification_request.clone());
         *self.sas_verification.write().unwrap() = None;
         *self.qr_verification.write().unwrap() = None;
+        self.locally_starting_sas.store(false, Ordering::Release);
+        self.listener_tasks.abort_all();
 
-        get_runtime_handle().spawn(Self::listen_to_verification_request_changes(
+        self.install_request_listener(verification_request);
+
+        Ok(())
+    }
+
+    fn install_request_listener(&self, verification_request: VerificationRequest) {
+        let task = get_runtime_handle().spawn(Self::listen_to_verification_request_changes(
             verification_request,
             self.sas_verification.clone(),
             self.delegate.clone(),
+            Arc::downgrade(&self.listener_tasks),
+            self.locally_starting_sas.clone(),
         ));
-
-        Ok(())
+        self.listener_tasks.replace_request_listener(task.abort_handle());
     }
 
     /// Clone the current delegate out of the lock, releasing the read guard
@@ -399,31 +458,45 @@ impl SessionVerificationController {
         verification_request: VerificationRequest,
         sas_verification: Arc<RwLock<Option<SasVerification>>>,
         delegate: Delegate,
+        listener_tasks: Weak<ListenerTasks>,
+        locally_starting_sas: Arc<AtomicBool>,
     ) {
         let mut stream = verification_request.changes();
 
         while let Some(state) = stream.next().await {
             match state {
                 VerificationRequestState::Transitioned { verification } => {
-                    if let Some(verification) = verification.sas() {
-                        *sas_verification.write().unwrap() = Some(verification.clone());
-
-                        if verification.accept().await.is_ok() {
-                            if let Some(current_delegate) = Self::current_delegate(&delegate) {
-                                current_delegate.did_start_sas_verification()
-                            }
-
-                            get_runtime_handle().spawn(Self::listen_to_sas_verification_changes(
-                                verification,
-                                delegate.clone(),
-                            ));
-                        } else if let Some(current_delegate) = Self::current_delegate(&delegate) {
-                            current_delegate.did_fail()
-                        }
+                    if verification.clone().qr().is_some() {
+                        // QR generate/scan installs a concrete listener after its
+                        // fallible continuation succeeds. Until then this request
+                        // listener remains the terminal-event fallback.
+                        continue;
                     }
 
-                    // Terminal callback ownership transfers to the concrete SAS
-                    // or QR listener once the request transitions.
+                    let Some(verification) = verification.sas() else { continue };
+                    *sas_verification.write().unwrap() = Some(verification.clone());
+
+                    let Some(listener_tasks) = listener_tasks.upgrade() else { break };
+                    let task =
+                        get_runtime_handle().spawn(Self::listen_to_sas_verification_changes(
+                            verification.clone(),
+                            delegate.clone(),
+                        ));
+                    listener_tasks.replace_concrete_listener(task.abort_handle(), false);
+
+                    let locally_started = locally_starting_sas.swap(false, Ordering::AcqRel);
+                    if !locally_started && verification.accept().await.is_err() {
+                        if let Some(current_delegate) = Self::current_delegate(&delegate) {
+                            current_delegate.did_fail()
+                        }
+                        break;
+                    }
+                    if let Some(current_delegate) = Self::current_delegate(&delegate) {
+                        current_delegate.did_start_sas_verification()
+                    }
+
+                    // The concrete SAS listener was installed before the only
+                    // fallible handoff, so it now owns terminal events.
                     break;
                 }
                 VerificationRequestState::Ready { .. } => {
@@ -539,8 +612,9 @@ mod tests {
     use matrix_sdk::ruma::events::key::verification::VerificationMethod;
 
     use super::{
-        Delegate, SessionVerificationController, SessionVerificationControllerDelegate,
-        SessionVerificationData, SessionVerificationQrState, SessionVerificationRequestDetails,
+        Delegate, ListenerTasks, SessionVerificationController,
+        SessionVerificationControllerDelegate, SessionVerificationData, SessionVerificationQrState,
+        SessionVerificationRequestDetails,
     };
 
     #[test]
@@ -599,7 +673,7 @@ mod tests {
     }
 
     #[test]
-    fn request_listener_transfers_terminal_ownership_when_verification_transitions() {
+    fn request_listener_transfers_terminal_ownership_when_sas_transitions() {
         let source = include_str!("session_verification.rs");
         let transitioned = source_section(
             source,
@@ -607,11 +681,8 @@ mod tests {
             "VerificationRequestState::Ready { .. } =>",
         );
 
-        assert!(transitioned.contains("break;"), "transition must stop the request listener");
-        assert!(
-            !transitioned.contains("continue;"),
-            "transition must not leave the request listener observing terminal events"
-        );
+        assert!(transitioned.contains("replace_concrete_listener"));
+        assert!(transitioned.contains("break;"), "SAS transition must stop the request listener");
     }
 
     #[test]
@@ -629,5 +700,106 @@ mod tests {
         assert!(done.contains("break;"));
         assert!(cancelled.contains("did_cancel()"));
         assert!(cancelled.contains("break;"));
+    }
+
+    #[test]
+    fn locally_started_sas_has_only_the_request_listener_as_owner() {
+        let source = include_str!("session_verification.rs");
+        let start_sas = source_section(
+            source,
+            "pub async fn start_sas_verification",
+            "pub async fn generate_qr_verification_code",
+        );
+
+        assert!(!start_sas.contains("listen_to_sas_verification_changes"));
+        assert!(!start_sas.contains("did_start_sas_verification"));
+    }
+
+    #[test]
+    fn qr_replacement_uses_one_cancellable_concrete_listener() {
+        let source = include_str!("session_verification.rs");
+        let generate = source_section(
+            source,
+            "pub async fn generate_qr_verification_code",
+            "pub async fn scan_qr_verification_code",
+        );
+        let scan = source_section(
+            source,
+            "pub async fn scan_qr_verification_code",
+            "pub async fn confirm_qr_verification",
+        );
+
+        assert!(generate.contains("replace_concrete_listener"));
+        assert!(scan.contains("replace_concrete_listener"));
+        assert!(scan.contains("abort_concrete_listener"));
+        assert!(scan.contains("install_request_listener"));
+        assert!(generate.contains("task.abort_handle()"));
+        assert!(scan.contains("task.abort_handle()"));
+        assert!(
+            scan.find("install_request_listener") < scan.find(".scan_qr_code(data)"),
+            "request fallback must be restored before fallible QR reciprocation"
+        );
+    }
+
+    #[test]
+    fn qr_transition_keeps_request_fallback_until_concrete_listener_is_installed() {
+        let source = include_str!("session_verification.rs");
+        let transitioned = source_section(
+            source,
+            "VerificationRequestState::Transitioned { verification } =>",
+            "VerificationRequestState::Ready { .. } =>",
+        );
+
+        assert!(transitioned.contains(".qr().is_some()"));
+        assert!(transitioned.contains("continue;"));
+        assert!(transitioned.contains("replace_concrete_listener"));
+        assert!(
+            transitioned.find("replace_concrete_listener") < transitioned.find(".accept().await"),
+            "incoming SAS must install terminal observation before its fallible accept"
+        );
+    }
+
+    #[tokio::test]
+    async fn replacing_concrete_listener_cancels_previous_task() {
+        let tasks = ListenerTasks::default();
+        let first = tokio::spawn(std::future::pending::<()>());
+        tasks.replace_concrete_listener(first.abort_handle(), false);
+
+        let second = tokio::spawn(std::future::pending::<()>());
+        tasks.replace_concrete_listener(second.abort_handle(), false);
+
+        assert!(first.await.expect_err("replaced listener must be cancelled").is_cancelled());
+        tasks.abort_all();
+        assert!(second.await.expect_err("active listener must be drained").is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn concrete_handoff_cancels_request_fallback() {
+        let tasks = ListenerTasks::default();
+        let request = tokio::spawn(std::future::pending::<()>());
+        tasks.replace_request_listener(request.abort_handle());
+
+        let concrete = tokio::spawn(std::future::pending::<()>());
+        tasks.replace_concrete_listener(concrete.abort_handle(), true);
+
+        assert!(request.await.expect_err("request fallback must be cancelled").is_cancelled());
+        tasks.abort_all();
+        assert!(concrete.await.expect_err("concrete listener must be drained").is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn dropping_final_task_owner_cancels_all_listeners() {
+        let tasks = Arc::new(ListenerTasks::default());
+        let weak_tasks = Arc::downgrade(&tasks);
+        let request = tokio::spawn(std::future::pending::<()>());
+        let concrete = tokio::spawn(std::future::pending::<()>());
+        tasks.replace_request_listener(request.abort_handle());
+        tasks.replace_concrete_listener(concrete.abort_handle(), false);
+
+        drop(tasks);
+
+        assert!(weak_tasks.upgrade().is_none());
+        assert!(request.await.expect_err("request listener must be drained").is_cancelled());
+        assert!(concrete.await.expect_err("concrete listener must be drained").is_cancelled());
     }
 }
