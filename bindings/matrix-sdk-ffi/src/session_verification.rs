@@ -405,36 +405,43 @@ impl SessionVerificationController {
         while let Some(state) = stream.next().await {
             match state {
                 VerificationRequestState::Transitioned { verification } => {
-                    let Some(verification) = verification.sas() else {
-                        // Explicit QR generate/scan operations retain and observe
-                        // their own QR verification object.
-                        continue;
-                    };
+                    if let Some(verification) = verification.sas() {
+                        *sas_verification.write().unwrap() = Some(verification.clone());
 
-                    *sas_verification.write().unwrap() = Some(verification.clone());
+                        if verification.accept().await.is_ok() {
+                            if let Some(current_delegate) = Self::current_delegate(&delegate) {
+                                current_delegate.did_start_sas_verification()
+                            }
 
-                    if verification.accept().await.is_ok() {
-                        if let Some(current_delegate) = Self::current_delegate(&delegate) {
-                            current_delegate.did_start_sas_verification()
+                            get_runtime_handle().spawn(Self::listen_to_sas_verification_changes(
+                                verification,
+                                delegate.clone(),
+                            ));
+                        } else if let Some(current_delegate) = Self::current_delegate(&delegate) {
+                            current_delegate.did_fail()
                         }
-
-                        get_runtime_handle().spawn(Self::listen_to_sas_verification_changes(
-                            verification,
-                            delegate.clone(),
-                        ));
-                    } else if let Some(current_delegate) = Self::current_delegate(&delegate) {
-                        current_delegate.did_fail()
                     }
+
+                    // Terminal callback ownership transfers to the concrete SAS
+                    // or QR listener once the request transitions.
+                    break;
                 }
                 VerificationRequestState::Ready { .. } => {
                     if let Some(current_delegate) = Self::current_delegate(&delegate) {
                         current_delegate.did_accept_verification_request()
                     }
                 }
+                VerificationRequestState::Done => {
+                    if let Some(current_delegate) = Self::current_delegate(&delegate) {
+                        current_delegate.did_finish();
+                    }
+                    break;
+                }
                 VerificationRequestState::Cancelled(..) => {
                     if let Some(current_delegate) = Self::current_delegate(&delegate) {
                         current_delegate.did_cancel();
                     }
+                    break;
                 }
                 _ => {}
             }
@@ -582,5 +589,45 @@ mod tests {
         }
 
         assert!(slot.read().unwrap().is_none(), "delegate should have detached itself");
+    }
+
+    fn source_section<'a>(source: &'a str, start: &str, end: &str) -> &'a str {
+        let start = source.find(start).expect("start marker must exist");
+        let remainder = &source[start..];
+        let end = remainder.find(end).expect("end marker must exist after start");
+        &remainder[..end]
+    }
+
+    #[test]
+    fn request_listener_transfers_terminal_ownership_when_verification_transitions() {
+        let source = include_str!("session_verification.rs");
+        let transitioned = source_section(
+            source,
+            "VerificationRequestState::Transitioned { verification } =>",
+            "VerificationRequestState::Ready { .. } =>",
+        );
+
+        assert!(transitioned.contains("break;"), "transition must stop the request listener");
+        assert!(
+            !transitioned.contains("continue;"),
+            "transition must not leave the request listener observing terminal events"
+        );
+    }
+
+    #[test]
+    fn request_listener_stops_after_direct_terminal_events() {
+        let source = include_str!("session_verification.rs");
+        let done = source_section(
+            source,
+            "VerificationRequestState::Done =>",
+            "VerificationRequestState::Cancelled(..) =>",
+        );
+        let cancelled =
+            source_section(source, "VerificationRequestState::Cancelled(..) =>", "_ => {}");
+
+        assert!(done.contains("did_finish()"));
+        assert!(done.contains("break;"));
+        assert!(cancelled.contains("did_cancel()"));
+        assert!(cancelled.contains("break;"));
     }
 }
