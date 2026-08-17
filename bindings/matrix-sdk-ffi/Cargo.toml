@@ -58,6 +58,7 @@ matrix-sdk = { workspace = true, features = [
     "e2e-encryption",
     "experimental-widgets",
     "markdown",
+    "qrcode",
     "socks",
     "uniffi",
     "federation-api",

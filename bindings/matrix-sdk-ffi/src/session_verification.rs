@@ -20,7 +20,10 @@ use matrix_sdk::{
     encryption::{
         Encryption,
         identities::UserIdentity,
-        verification::{SasState, SasVerification, VerificationRequest, VerificationRequestState},
+        verification::{
+            QrVerification, QrVerificationData, QrVerificationState, SasState, SasVerification,
+            VerificationRequest, VerificationRequestState,
+        },
     },
     ruma::events::key::verification::VerificationMethod,
 };
@@ -55,6 +58,13 @@ pub enum SessionVerificationData {
     Decimals { values: Vec<u16> },
 }
 
+#[derive(uniffi::Enum)]
+pub enum SessionVerificationQrState {
+    Scanned,
+    Reciprocated,
+    Confirmed,
+}
+
 /// Details about the incoming verification request
 #[derive(uniffi::Record)]
 pub struct SessionVerificationRequestDetails {
@@ -72,6 +82,7 @@ pub trait SessionVerificationControllerDelegate: SyncOutsideWasm + SendOutsideWa
     fn did_accept_verification_request(&self);
     fn did_start_sas_verification(&self);
     fn did_receive_verification_data(&self, data: SessionVerificationData);
+    fn did_update_qr_verification(&self, state: SessionVerificationQrState);
     fn did_fail(&self);
     fn did_cancel(&self);
     fn did_finish(&self);
@@ -87,6 +98,7 @@ pub struct SessionVerificationController {
     delegate: Delegate,
     verification_request: Arc<RwLock<Option<VerificationRequest>>>,
     sas_verification: Arc<RwLock<Option<SasVerification>>>,
+    qr_verification: Arc<RwLock<Option<QrVerification>>>,
 }
 
 #[matrix_sdk_ffi_macros::export]
@@ -120,8 +132,9 @@ impl SessionVerificationController {
         let verification_request = self.verification_request.read().unwrap().clone();
 
         if let Some(verification_request) = verification_request {
-            let methods = vec![VerificationMethod::SasV1];
-            verification_request.accept_with_methods(methods).await?;
+            verification_request
+                .accept_with_methods(Self::supported_verification_methods())
+                .await?;
         }
 
         Ok(())
@@ -129,9 +142,10 @@ impl SessionVerificationController {
 
     /// Request verification for the current device
     pub async fn request_device_verification(&self) -> Result<(), ClientError> {
-        let methods = vec![VerificationMethod::SasV1];
-        let verification_request =
-            self.user_identity.request_verification_with_methods(methods).await?;
+        let verification_request = self
+            .user_identity
+            .request_verification_with_methods(Self::supported_verification_methods())
+            .await?;
 
         self.set_ongoing_verification_request(verification_request)
     }
@@ -150,9 +164,9 @@ impl SessionVerificationController {
             return Err(ClientError::from_str("User is already verified", None));
         }
 
-        let methods = vec![VerificationMethod::SasV1];
-
-        let verification_request = user_identity.request_verification_with_methods(methods).await?;
+        let verification_request = user_identity
+            .request_verification_with_methods(Self::supported_verification_methods())
+            .await?;
 
         self.set_ongoing_verification_request(verification_request)
     }
@@ -188,6 +202,55 @@ impl SessionVerificationController {
         Ok(())
     }
 
+    /// Generate raw Matrix QR verification bytes for another signed-in device
+    /// to scan. These bytes must be encoded directly into a QR image.
+    pub async fn generate_qr_verification_code(&self) -> Result<Vec<u8>, ClientError> {
+        let verification_request = self.verification_request.read().unwrap().clone();
+        let Some(verification_request) = verification_request else {
+            return Err(ClientError::from_str("Verification request missing.", None));
+        };
+
+        let qr = verification_request
+            .generate_qr_code()
+            .await?
+            .ok_or(ClientError::from_str("QR verification is unavailable.", None))?;
+        let bytes = qr.to_bytes().map_err(|error| {
+            ClientError::from_str(format!("Failed encoding QR verification: {error}"), None)
+        })?;
+        *self.qr_verification.write().unwrap() = Some(qr.clone());
+        get_runtime_handle()
+            .spawn(Self::listen_to_qr_verification_changes(qr, self.delegate.clone()));
+        Ok(bytes)
+    }
+
+    /// Scan raw Matrix QR verification bytes from another signed-in device.
+    pub async fn scan_qr_verification_code(&self, data: Vec<u8>) -> Result<(), ClientError> {
+        let verification_request = self.verification_request.read().unwrap().clone();
+        let Some(verification_request) = verification_request else {
+            return Err(ClientError::from_str("Verification request missing.", None));
+        };
+        let data = QrVerificationData::from_bytes(data).map_err(|error| {
+            ClientError::from_str(format!("Invalid QR verification data: {error}"), None)
+        })?;
+        let qr = verification_request
+            .scan_qr_code(data)
+            .await?
+            .ok_or(ClientError::from_str("QR verification is unavailable.", None))?;
+        *self.qr_verification.write().unwrap() = Some(qr.clone());
+        get_runtime_handle()
+            .spawn(Self::listen_to_qr_verification_changes(qr, self.delegate.clone()));
+        Ok(())
+    }
+
+    /// Confirm that the other signed-in device scanned the displayed QR code.
+    pub async fn confirm_qr_verification(&self) -> Result<(), ClientError> {
+        let qr_verification = self.qr_verification.read().unwrap().clone();
+        let Some(qr_verification) = qr_verification else {
+            return Err(ClientError::from_str("QR verification missing", None));
+        };
+        Ok(qr_verification.confirm().await?)
+    }
+
     /// Confirm that the short auth strings match on both sides.
     pub async fn approve_verification(&self) -> Result<(), ClientError> {
         let sas_verification = self.sas_verification.read().unwrap().clone();
@@ -212,6 +275,10 @@ impl SessionVerificationController {
 
     /// Cancel the current verification request
     pub async fn cancel_verification(&self) -> Result<(), ClientError> {
+        let qr_verification = self.qr_verification.read().unwrap().clone();
+        if let Some(qr_verification) = qr_verification {
+            return Ok(qr_verification.cancel().await?);
+        }
         let verification_request = self.verification_request.read().unwrap().clone();
 
         let Some(verification_request) = verification_request else {
@@ -223,6 +290,15 @@ impl SessionVerificationController {
 }
 
 impl SessionVerificationController {
+    fn supported_verification_methods() -> Vec<VerificationMethod> {
+        vec![
+            VerificationMethod::SasV1,
+            VerificationMethod::QrCodeScanV1,
+            VerificationMethod::QrCodeShowV1,
+            VerificationMethod::ReciprocateV1,
+        ]
+    }
+
     pub(crate) fn new(
         encryption: Encryption,
         user_identity: UserIdentity,
@@ -235,6 +311,7 @@ impl SessionVerificationController {
             delegate: Arc::new(RwLock::new(None)),
             verification_request: Arc::new(RwLock::new(None)),
             sas_verification: Arc::new(RwLock::new(None)),
+            qr_verification: Arc::new(RwLock::new(None)),
         }
     }
 
@@ -296,6 +373,8 @@ impl SessionVerificationController {
         }
 
         *self.verification_request.write().unwrap() = Some(verification_request.clone());
+        *self.sas_verification.write().unwrap() = None;
+        *self.qr_verification.write().unwrap() = None;
 
         get_runtime_handle().spawn(Self::listen_to_verification_request_changes(
             verification_request,
@@ -327,8 +406,9 @@ impl SessionVerificationController {
             match state {
                 VerificationRequestState::Transitioned { verification } => {
                     let Some(verification) = verification.sas() else {
-                        error!("Invalid, non-sas verification flow. Returning.");
-                        return;
+                        // Explicit QR generate/scan operations retain and observe
+                        // their own QR verification object.
+                        continue;
                     };
 
                     *sas_verification.write().unwrap() = Some(verification.clone());
@@ -414,16 +494,60 @@ impl SessionVerificationController {
             }
         }
     }
+
+    async fn listen_to_qr_verification_changes(qr: QrVerification, delegate: Delegate) {
+        let mut stream = qr.changes();
+        while let Some(state) = stream.next().await {
+            let update = match state {
+                QrVerificationState::Scanned => Some(SessionVerificationQrState::Scanned),
+                QrVerificationState::Reciprocated => Some(SessionVerificationQrState::Reciprocated),
+                QrVerificationState::Confirmed => Some(SessionVerificationQrState::Confirmed),
+                QrVerificationState::Done { .. } => {
+                    if let Some(current_delegate) = Self::current_delegate(&delegate) {
+                        current_delegate.did_finish();
+                    }
+                    break;
+                }
+                QrVerificationState::Cancelled(_) => {
+                    if let Some(current_delegate) = Self::current_delegate(&delegate) {
+                        current_delegate.did_cancel();
+                    }
+                    break;
+                }
+                QrVerificationState::Started => None,
+            };
+            if let Some(update) = update
+                && let Some(current_delegate) = Self::current_delegate(&delegate)
+            {
+                current_delegate.did_update_qr_verification(update);
+            }
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use std::sync::{Arc, RwLock};
 
+    use matrix_sdk::ruma::events::key::verification::VerificationMethod;
+
     use super::{
         Delegate, SessionVerificationController, SessionVerificationControllerDelegate,
-        SessionVerificationData, SessionVerificationRequestDetails,
+        SessionVerificationData, SessionVerificationQrState, SessionVerificationRequestDetails,
     };
+
+    #[test]
+    fn advertises_post_login_qr_and_sas_methods() {
+        assert_eq!(
+            SessionVerificationController::supported_verification_methods(),
+            vec![
+                VerificationMethod::SasV1,
+                VerificationMethod::QrCodeScanV1,
+                VerificationMethod::QrCodeShowV1,
+                VerificationMethod::ReciprocateV1,
+            ]
+        );
+    }
 
     /// A delegate that detaches itself from within a callback. The only
     /// documented way to detach is `set_delegate(None)`, which takes the
@@ -440,6 +564,7 @@ mod tests {
         fn did_accept_verification_request(&self) {}
         fn did_start_sas_verification(&self) {}
         fn did_receive_verification_data(&self, _: SessionVerificationData) {}
+        fn did_update_qr_verification(&self, _: SessionVerificationQrState) {}
         fn did_fail(&self) {}
         fn did_finish(&self) {}
     }
