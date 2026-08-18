@@ -12,7 +12,10 @@
 // See the License for that specific language governing permissions and
 // limitations under the License.
 
-use std::sync::{Arc, Mutex, RwLock, Weak};
+use std::{
+    future::Future,
+    sync::{Arc, Mutex, RwLock, Weak},
+};
 
 use futures_util::StreamExt;
 use matrix_sdk::{
@@ -90,6 +93,228 @@ pub trait SessionVerificationControllerDelegate: SyncOutsideWasm + SendOutsideWa
 
 pub type Delegate = Arc<RwLock<Option<Arc<dyn SessionVerificationControllerDelegate>>>>;
 type ListenerGeneration = u64;
+type AttemptToken = u64;
+
+#[derive(Clone, Copy)]
+enum ListenerSlot {
+    Request,
+    Concrete,
+}
+
+enum LifecycleCommand {
+    InstallListener {
+        slot: ListenerSlot,
+        handle: AbortHandle,
+        reply: tokio::sync::oneshot::Sender<Result<AttemptToken, ()>>,
+    },
+    InstallAttempt {
+        handle: AbortHandle,
+        start: tokio::sync::oneshot::Sender<()>,
+    },
+    Activate {
+        reply: tokio::sync::oneshot::Sender<Result<AttemptToken, ()>>,
+    },
+    ActiveToken {
+        reply: tokio::sync::oneshot::Sender<Option<AttemptToken>>,
+    },
+    IsActive {
+        token: AttemptToken,
+        reply: tokio::sync::oneshot::Sender<bool>,
+    },
+    #[cfg(test)]
+    SetNextToken {
+        token: AttemptToken,
+        reply: tokio::sync::oneshot::Sender<()>,
+    },
+}
+
+struct LifecycleActorState {
+    next_token: AttemptToken,
+    active_token: Option<AttemptToken>,
+    request: Option<AbortHandle>,
+    concrete: Option<AbortHandle>,
+    attempt: Option<AbortHandle>,
+}
+
+impl LifecycleActorState {
+    fn activate(&mut self) -> Result<AttemptToken, ()> {
+        let token = self.next_token.checked_add(1).ok_or(())?;
+        self.next_token = token;
+        self.active_token = Some(token);
+        Ok(token)
+    }
+
+    fn abort_all(&mut self) {
+        for handle in
+            [self.request.take(), self.concrete.take(), self.attempt.take()].into_iter().flatten()
+        {
+            handle.abort();
+        }
+    }
+}
+
+impl Drop for LifecycleActorState {
+    fn drop(&mut self) {
+        self.abort_all();
+    }
+}
+
+#[derive(Clone)]
+struct LifecycleActor {
+    commands: tokio::sync::mpsc::UnboundedSender<LifecycleCommand>,
+}
+
+#[derive(Clone)]
+struct CallbackDispatcher {
+    commands: tokio::sync::mpsc::UnboundedSender<LifecycleCommand>,
+}
+
+impl LifecycleActor {
+    fn new() -> (Self, CallbackDispatcher) {
+        let (commands, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+        get_runtime_handle().spawn(async move {
+            let mut state = LifecycleActorState {
+                next_token: 0,
+                active_token: None,
+                request: None,
+                concrete: None,
+                attempt: None,
+            };
+            while let Some(command) = receiver.recv().await {
+                match command {
+                    LifecycleCommand::InstallListener { slot, handle, reply } => {
+                        let token = state.activate();
+                        if token.is_ok() {
+                            let replaced = match slot {
+                                ListenerSlot::Request => {
+                                    if let Some(concrete) = state.concrete.take() {
+                                        concrete.abort();
+                                    }
+                                    state.request.replace(handle)
+                                }
+                                ListenerSlot::Concrete => {
+                                    if let Some(request) = state.request.take() {
+                                        request.abort();
+                                    }
+                                    state.concrete.replace(handle)
+                                }
+                            };
+                            if let Some(replaced) = replaced {
+                                replaced.abort();
+                            }
+                        } else {
+                            handle.abort();
+                            state.active_token = None;
+                        }
+                        let _ = reply.send(token);
+                    }
+                    LifecycleCommand::InstallAttempt { handle, start } => {
+                        if let Some(previous) = state.attempt.replace(handle) {
+                            previous.abort();
+                        }
+                        let _ = start.send(());
+                    }
+                    LifecycleCommand::Activate { reply } => {
+                        let token = state.activate();
+                        if token.is_err() {
+                            state.active_token = None;
+                        }
+                        let _ = reply.send(token);
+                    }
+                    LifecycleCommand::ActiveToken { reply } => {
+                        let _ = reply.send(state.active_token);
+                    }
+                    LifecycleCommand::IsActive { token, reply } => {
+                        let _ = reply.send(state.active_token == Some(token));
+                    }
+                    #[cfg(test)]
+                    LifecycleCommand::SetNextToken { token, reply } => {
+                        state.next_token = token;
+                        state.active_token = None;
+                        let _ = reply.send(());
+                    }
+                }
+            }
+        });
+        (Self { commands: commands.clone() }, CallbackDispatcher { commands })
+    }
+
+    async fn install_listener(&self, slot: ListenerSlot, handle: AbortHandle) -> AttemptToken {
+        let (reply, result) = tokio::sync::oneshot::channel();
+        self.commands
+            .send(LifecycleCommand::InstallListener { slot, handle, reply })
+            .expect("lifecycle actor must be running");
+        result.await.expect("lifecycle actor must reply").expect("token space exhausted")
+    }
+
+    async fn active_token(&self) -> Option<AttemptToken> {
+        let (reply, result) = tokio::sync::oneshot::channel();
+        self.commands
+            .send(LifecycleCommand::ActiveToken { reply })
+            .expect("lifecycle actor must be running");
+        result.await.expect("lifecycle actor must reply")
+    }
+
+    async fn try_activate(&self) -> Result<AttemptToken, ()> {
+        let (reply, result) = tokio::sync::oneshot::channel();
+        self.commands.send(LifecycleCommand::Activate { reply }).map_err(|_| ())?;
+        result.await.map_err(|_| ())?
+    }
+
+    async fn run_owned_attempt<F>(&self, future: F) -> tokio::sync::oneshot::Receiver<()>
+    where
+        F: Future<Output = ()> + Send + 'static,
+    {
+        let (start, started) = tokio::sync::oneshot::channel();
+        let (finished, waiter) = tokio::sync::oneshot::channel();
+        let task = get_runtime_handle().spawn(async move {
+            if started.await.is_ok() {
+                future.await;
+                let _ = finished.send(());
+            }
+        });
+        self.commands
+            .send(LifecycleCommand::InstallAttempt { handle: task.abort_handle(), start })
+            .expect("lifecycle actor must be running");
+        waiter
+    }
+
+    #[cfg(test)]
+    fn new_for_test() -> (Self, CallbackDispatcher) {
+        Self::new()
+    }
+
+    #[cfg(test)]
+    async fn activate_for_test(&self) -> AttemptToken {
+        self.try_activate().await.expect("token space must remain")
+    }
+
+    #[cfg(test)]
+    async fn try_activate_for_test(&self) -> Result<AttemptToken, ()> {
+        self.try_activate().await
+    }
+
+    #[cfg(test)]
+    async fn set_next_token_for_test(&self, token: AttemptToken) {
+        let (reply, result) = tokio::sync::oneshot::channel();
+        self.commands.send(LifecycleCommand::SetNextToken { token, reply }).unwrap();
+        result.await.unwrap();
+    }
+}
+
+impl CallbackDispatcher {
+    #[cfg(test)]
+    async fn dispatch_for_test<F>(&self, token: AttemptToken, callback: F)
+    where
+        F: FnOnce() + Send + 'static,
+    {
+        let (reply, result) = tokio::sync::oneshot::channel();
+        self.commands.send(LifecycleCommand::IsActive { token, reply }).unwrap();
+        if result.await.unwrap() {
+            tokio::task::spawn_blocking(callback).await.unwrap();
+        }
+    }
+}
 
 #[derive(Default)]
 struct CallbackAuthority {
@@ -770,9 +995,9 @@ mod tests {
     use matrix_sdk::ruma::events::key::verification::VerificationMethod;
 
     use super::{
-        CallbackAuthority, Delegate, ListenerTasks, SessionVerificationController,
-        SessionVerificationControllerDelegate, SessionVerificationData, SessionVerificationQrState,
-        SessionVerificationRequestDetails,
+        CallbackAuthority, Delegate, LifecycleActor, ListenerSlot, ListenerTasks,
+        SessionVerificationController, SessionVerificationControllerDelegate,
+        SessionVerificationData, SessionVerificationQrState, SessionVerificationRequestDetails,
     };
 
     #[test]
@@ -1096,5 +1321,84 @@ mod tests {
         drop(tasks);
 
         assert!(request.await.expect_err("request handoff must be cancelled").is_cancelled());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn lifecycle_actor_atomically_matches_active_token_and_retained_listener() {
+        let (lifecycle, _callbacks) = LifecycleActor::new_for_test();
+        let first = tokio::spawn(std::future::pending::<()>());
+        let second = tokio::spawn(std::future::pending::<()>());
+
+        let (first_token, second_token) = tokio::join!(
+            lifecycle.install_listener(ListenerSlot::Concrete, first.abort_handle()),
+            lifecycle.install_listener(ListenerSlot::Concrete, second.abort_handle()),
+        );
+        let active = lifecycle.active_token().await.expect("an active listener must exist");
+
+        assert!(active == first_token || active == second_token);
+        if active == first_token {
+            assert!(second.await.expect_err("superseded listener must stop").is_cancelled());
+            assert!(!first.is_finished());
+            first.abort();
+        } else {
+            assert!(first.await.expect_err("superseded listener must stop").is_cancelled());
+            assert!(!second.is_finished());
+            second.abort();
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn lifecycle_actor_services_reentry_while_delegate_callback_runs() {
+        let (lifecycle, callbacks) = LifecycleActor::new_for_test();
+        let token = lifecycle.activate_for_test().await;
+        let reentrant_lifecycle = lifecycle.clone();
+        let (completed_tx, completed_rx) = tokio::sync::oneshot::channel();
+
+        callbacks
+            .dispatch_for_test(token, move || {
+                tokio::runtime::Handle::current().block_on(async move {
+                    reentrant_lifecycle.activate_for_test().await;
+                    completed_tx.send(()).unwrap();
+                });
+            })
+            .await;
+
+        tokio::time::timeout(Duration::from_secs(1), completed_rx)
+            .await
+            .expect("reentrant lifecycle operation must not deadlock")
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn lifecycle_actor_fails_closed_when_token_space_is_exhausted() {
+        let (lifecycle, _callbacks) = LifecycleActor::new_for_test();
+        lifecycle.set_next_token_for_test(u64::MAX).await;
+
+        assert!(lifecycle.try_activate_for_test().await.is_err());
+        assert!(lifecycle.active_token().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn actor_owned_attempt_survives_dropped_exported_waiter() {
+        let (lifecycle, _callbacks) = LifecycleActor::new_for_test();
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let (finished_tx, finished_rx) = tokio::sync::oneshot::channel();
+
+        let waiter = lifecycle
+            .run_owned_attempt(async move {
+                entered_tx.send(()).unwrap();
+                release_rx.await.unwrap();
+                finished_tx.send(()).unwrap();
+            })
+            .await;
+        entered_rx.await.unwrap();
+        drop(waiter);
+        release_tx.send(()).unwrap();
+
+        tokio::time::timeout(Duration::from_secs(1), finished_rx)
+            .await
+            .expect("owned attempt must outlive its exported waiter")
+            .unwrap();
     }
 }
